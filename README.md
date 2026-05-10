@@ -155,7 +155,7 @@ volumes:
 
 ## Proxmox LXC Container
 
-`build-proxmox-ct.sh` builds a self-contained Proxmox LXC rootfs tarball from WSL2. It bootstraps a Debian Trixie rootfs, installs all runtime dependencies (Python, .NET, vgmstream, FFmpeg), builds RsCli, copies the app, and packages the result as a `.tar.zst` importable by `pct restore`.
+`build-proxmox-ct.sh` builds a self-contained Proxmox LXC rootfs tarball from WSL2. It bootstraps a Debian Trixie rootfs, installs the runtime dependencies (Python, FFmpeg, fluidsynth, vgmstream) plus a build-only .NET SDK, builds RsCli, copies the app, removes the .NET SDK, and packages the result as a `.tar.zst` importable by `pct restore`.
 
 ```bash
 # Prerequisites (WSL2):
