@@ -2314,6 +2314,9 @@ function createHighway() {
             _wsGen += 1;
             // Fresh routing promise for this connection's song_info load.
             _juceRoutingPromise = Promise.resolve();
+            // Clear any stale "initial routing in-flight" flag from a prior
+            // connection so the app.js engine-reroute watcher isn't wedged.
+            window._highwayJuceRoutingPending = false;
             ws = new WebSocket(wsUrl);
             ws.onclose = () => { console.log('WS closed'); };
             ws.onerror = (e) => { console.error('WS error', e); };
@@ -2466,14 +2469,20 @@ function createHighway() {
                                 if (msg.audio_url) {
                                     const audio = document.getElementById('audio');
                                     const audioFilename = msg.audio_url.split('/').pop();
+                                    // Only attempt JUCE routing for /audio/ URLs — sloppak stems
+                                    // (/api/sloppak/…) are not resolvable via audio-local-path.
+                                    const isAudioUrl = msg.audio_url.startsWith('/audio/');
+                                    // Record the loaded song's audio so app.js can re-route it
+                                    // between the HTML5 and JUCE paths if the audio engine is
+                                    // started/stopped after the song is already loaded. Set this
+                                    // unconditionally (not just on reload): when alreadyLoaded is
+                                    // true the watcher must still see correct, current metadata.
+                                    window._currentSongAudio = { url: msg.audio_url, juceEligible: isAudioUrl };
                                     const alreadyLoaded = window._juceMode
                                         ? window._juceAudioUrl === msg.audio_url
                                         : (audio.src && audio.src.includes(audioFilename));
                                     if (!alreadyLoaded) {
                                         const juceApi = window.slopsmithDesktop?.audio;
-                                        // Only attempt JUCE routing for /audio/ URLs — sloppak stems
-                                        // (/api/sloppak/…) are not resolvable via audio-local-path.
-                                        const isAudioUrl = msg.audio_url.startsWith('/audio/');
                                         if (isAudioUrl && juceApi) {
                                             // Run JUCE routing off the critical message-processing chain
                                             // so subsequent notes/chords/ready messages aren't blocked
@@ -2481,6 +2490,11 @@ function createHighway() {
                                             // awaits _juceRoutingPromise so _juceMode is settled before
                                             // _onReady / song:ready fire.
                                             const audioUrl = msg.audio_url;
+                                            // Flag the initial song-load JUCE routing as in-flight so the
+                                            // app.js engine-reroute watcher stands down until _juceMode is
+                                            // settled — otherwise its 350ms poll could race this routing
+                                            // and double-call loadBackingTrack for the same URL.
+                                            window._highwayJuceRoutingPending = true;
                                             _juceRoutingPromise = (async () => {
                                                 let pathLabel = '<missing>';
                                                 try {
@@ -2569,9 +2583,24 @@ function createHighway() {
                                                 }
                                                 audio.load();
                                                 _showAudioBufferingOverlay(audio);
-                                            })();
+                                            })().finally(() => {
+                                                // Initial routing settled (success, fallback, or stale
+                                                // bail) — release the app.js engine-reroute watcher.
+                                                // Only clear if this is still the live connection: a
+                                                // stale finally from a previous song must not release
+                                                // the gate for a newer in-flight load (which has its
+                                                // own pending=true and will clear its own finally).
+                                                if (gen === _wsGen) {
+                                                    window._highwayJuceRoutingPending = false;
+                                                }
+                                            });
                                         } else {
-                                            // Non-JUCE path: sloppak stems, or no JUCE API present
+                                            // Non-JUCE path: sloppak stems, or no JUCE API present.
+                                            // This branch does NOT set/clear
+                                            // window._highwayJuceRoutingPending — that gate guards
+                                            // only the async JUCE-routing branch above. This path is
+                                            // synchronous and brief, so the app.js reroute watcher
+                                            // running concurrently here is harmless.
                                             window._juceMode = false;
                                             window._juceAudioUrl = null;
                                             audio.src = msg.audio_url;

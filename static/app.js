@@ -916,6 +916,9 @@ async function showScreen(id) {
         const audio = document.getElementById('audio');
         audio.pause();
         audio.src = '';
+        window._currentSongAudio = null;
+        // Reloading any song later should get a fresh JUCE routing attempt.
+        window._clearJuceRerouteMemo?.();
         isPlaying = false;
         document.getElementById('btn-play').textContent = '▶ Play';
     }
@@ -2891,6 +2894,314 @@ const jucePlayer = {
 };
 window.jucePlayer = jucePlayer;
 
+// ── Engine start/stop → re-route song audio (HTML5 ⇄ JUCE) ──────────────────
+// window._juceMode is otherwise decided once, at song-load time (highway.js),
+// from isAudioRunning(). If the JUCE audio engine is started or stopped *after*
+// a song is already loaded (e.g. the user presses CHAIN / AMP), that decision
+// goes stale: the song stays on the HTML5 <audio> element while the engine
+// grabs the device in exclusive mode (audible guitar, silent song), or it stays
+// on a dead JUCE backing transport. This watcher migrates the loaded song
+// between the two paths whenever the engine's running state changes, preserving
+// playback position and play/pause state.
+(function _installJuceEngineRoutingWatcher() {
+    const juceApi = window.slopsmithDesktop?.audio;
+    if (!juceApi || typeof juceApi.isAudioRunning !== 'function') return;
+
+    let _rerouteInFlight = false;
+    // URL that JUCE's loadBackingTrack *explicitly rejected* (ok === false —
+    // e.g. a codec it can't read). The poll below would otherwise retry the
+    // same doomed track every 350 ms; remember it and skip until the song
+    // changes. Only a hard JUCE reject is memoised here — transient failures
+    // (a network blip on /api/audio-local-path, an isAudioRunning() race
+    // during a device restart) are deliberately NOT memoised so they retry.
+    let _rerouteRejectedUrl = null;
+    // Returns true when window._currentSongAudio no longer references the exact
+    // snapshot object captured at reroute entry — i.e. the song was swapped (or
+    // cleared) mid-flight. Staleness is detected by object-reference identity,
+    // not by URL value.
+    function _isStale(songAudio) {
+        return window._currentSongAudio !== songAudio;
+    }
+
+    // Migrates the loaded song from the HTML5 element onto the JUCE backing
+    // transport. Throws only on transient/unexpected failures.
+    // `songAudio` is the snapshot captured at reroute entry; if it stops being
+    // the current song mid-flight we abort without mutating global routing.
+    // Returns a distinct string outcome — the caller must NOT conflate them:
+    //   'switched' — song now plays via JUCE.
+    //   'rejected' — JUCE hard-rejected the track (codec). Caller memoises it.
+    //   'stale'    — the loaded song changed mid-flight; aborted, NOT memoised.
+    // (a transient transport-start failure throws instead — also not memoised.)
+    async function _switchHtml5ToJuce(songAudio) {
+        const url = songAudio.url;
+        const wasPlaying = isPlaying;
+        const pos = audio.currentTime || 0;
+        // Mark a reroute in progress so the <audio> 'play'/'pause' listeners
+        // suppress their song:play / song:pause emissions: the migration is
+        // transparent — playback genuinely continues — so plugin state and
+        // window.slopsmith.isPlaying must NOT flip. This also silences the
+        // "Audio paused unexpectedly" diagnostic. A REFCOUNT (not a boolean)
+        // lets an overlapping reroute's deferred release coexist: each switch
+        // increments on entry and decrements after its own timeout; listeners
+        // treat any count > 0 as "reroute active".
+        window._juceRerouteInProgress = (window._juceRerouteInProgress || 0) + 1;
+        audio.pause();
+        try {
+            const res = await fetch(`/api/audio-local-path?url=${encodeURIComponent(url)}`);
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            const { path } = await res.json();
+            if (_isStale(songAudio)) return 'stale';   // song changed mid-fetch
+            const ok = await juceApi.loadBackingTrack(path);
+            if (ok === false) {
+                // JUCE rejected the track — stay on HTML5, resume if needed.
+                console.warn('[juce-reroute] loadBackingTrack rejected; staying on HTML5');
+                // Only resume if the element still has a source. In the normal
+                // flow audio.src is intact here, but a prior HTML5→JUCE switch
+                // clears it — re-point + load before resuming so a bounced
+                // reroute doesn't try to play() an empty element.
+                if (isPlaying && !_isStale(songAudio)) {
+                    if (!audio.src) { audio.src = url; audio.load(); }
+                    try { await audio.play(); } catch (_) { /* ignore */ }
+                }
+                return 'rejected';
+            }
+            if (_isStale(songAudio)) return 'stale';
+            const dur = await juceApi.getBackingDuration();
+            await juceApi.seekBacking(pos);
+            // Start the new transport BEFORE committing global routing state, so
+            // a play() failure can't leave us in "JUCE mode, nothing playing"
+            // (the silent-song state this watcher exists to prevent).
+            // jucePlayer.play() RETURNS false (it does not throw) when
+            // startBacking fails — check the result, don't just await it.
+            // A play() failure is a TRANSIENT transport-start issue, not a hard
+            // codec reject: throw (rather than returning 'rejected') so the
+            // caller's catch path handles it WITHOUT memoising the URL, leaving
+            // it free to retry on the next poll. Only 'rejected' is memoised.
+            // Re-read isPlaying as late as possible: the user can press Pause
+            // during the multi-await fetch/IPC chain above. Starting the JUCE
+            // transport off a stale `wasPlaying` snapshot would resume a song
+            // the user just paused. Only start it if playback is still wanted.
+            if (isPlaying) {
+                const started = await jucePlayer.play();
+                if (started === false) {
+                    if (!_isStale(songAudio) && isPlaying) {
+                        try { await audio.play(); } catch (_) { /* ignore */ }
+                    }
+                    throw new Error('jucePlayer.play() failed (transient transport start)');
+                }
+            }
+            if (_isStale(songAudio)) {
+                // Song changed while JUCE was spinning up — undo and bail.
+                await jucePlayer.pause().catch(() => {});
+                return 'stale';
+            }
+            if (window.jucePlayer) {
+                jucePlayer._dur = dur;
+                jucePlayer._pos = pos;
+                jucePlayer._pollAt = performance.now();
+            }
+            window._juceMode = true;
+            window._juceAudioUrl = url;
+            audio.src = '';
+            try {
+                const apply = window.slopsmith?.audio?.applySongVolume;
+                if (typeof apply === 'function') await apply();
+            } catch (_) { /* best-effort */ }
+            console.log('[juce-reroute] HTML5 → JUCE @', pos.toFixed(2), 's playing=', wasPlaying);
+            return 'switched';
+        } catch (err) {
+            // Path lookup, JSON parse, or a JUCE IPC call threw partway through.
+            // audio.pause() already ran above; restore HTML5 playback so a
+            // previously playing song isn't left silently paused, then re-throw
+            // so the caller logs it. The caller does NOT memoise this URL —
+            // transient failures must retry on the next poll.
+            if (isPlaying && !window._juceMode && !_isStale(songAudio)) {
+                if (!audio.src) { audio.src = url; audio.load(); }
+                try { await audio.play(); } catch (_) { /* ignore */ }
+            }
+            throw err;
+        } finally {
+            // Clearing audio.src above dispatches a 'pause' event in a later
+            // task, after this synchronous finally. Defer the refcount
+            // decrement so that trailing event is still suppressed; a 0ms
+            // timeout lands after the pending pause-event task. Decrementing
+            // (rather than zeroing) leaves any overlapping reroute's own
+            // suppression intact.
+            setTimeout(() => {
+                window._juceRerouteInProgress = Math.max(
+                    0, (window._juceRerouteInProgress || 1) - 1);
+            }, 0);
+        }
+    }
+
+    async function _switchJuceToHtml5(songAudio) {
+        const url = songAudio.url;
+        const wasPlaying = isPlaying;
+        const pos = (window.jucePlayer ? jucePlayer.currentTime : 0) || 0;
+        // Mark a reroute in progress (refcount) so the <audio> 'play' listener
+        // suppresses its song:play emission — the migration is transparent and
+        // playback genuinely continues, so plugin state must not flip. Held
+        // until after the (possibly deferred) audio.play() event has fired.
+        window._juceRerouteInProgress = (window._juceRerouteInProgress || 0) + 1;
+        let _suppressionReleased = false;
+        const _releaseSuppression = () => {
+            if (_suppressionReleased) return;
+            _suppressionReleased = true;
+            // Defer so the 'play' (or 'pause') event task fires while still
+            // suppressed; a 0ms timeout lands after it.
+            setTimeout(() => {
+                window._juceRerouteInProgress = Math.max(
+                    0, (window._juceRerouteInProgress || 1) - 1);
+            }, 0);
+        };
+        let _resumeScheduled = false;
+        try {
+            await jucePlayer.pause().catch(() => {});
+            if (_isStale(songAudio)) return;           // song changed mid-pause
+            window._juceMode = false;
+            window._juceAudioUrl = null;
+            audio.src = url;
+            audio.load();
+            // Resume only AFTER the seek so playback starts at `pos`, not at 0
+            // with an audible jump once metadata arrives.
+            const resumeAtPos = () => {
+                try {
+                    // The metadata event can land after a fast song switch —
+                    // bail before touching currentTime so a stale callback
+                    // doesn't seek the newly loaded song to the old position.
+                    if (_isStale(songAudio)) return;
+                    try { audio.currentTime = pos; } catch (_) { /* ignore */ }
+                    // Re-read isPlaying (not the entry snapshot): the user may
+                    // have pressed Pause during jucePlayer.pause()/metadata
+                    // load — don't resume a song they just paused.
+                    if (isPlaying) {
+                        audio.play().catch(() => { /* ignore */ });
+                    }
+                } finally {
+                    _releaseSuppression();
+                }
+            };
+            _resumeScheduled = true;
+            if (audio.readyState >= 1) {
+                resumeAtPos();
+            } else {
+                // Wait for metadata to resume at `pos`. But metadata may never
+                // arrive (bad URL, network error) — that would leak the
+                // suppression refcount and permanently silence song:play /
+                // song:pause. Guard with the element's 'error' event AND a
+                // backstop timeout; whichever fires first wins, the others are
+                // detached. _releaseSuppression is idempotent regardless.
+                let _settled = false;
+                const _onMeta = () => { finish(true); };
+                const _onErr = () => { finish(false); };
+                let _backstop;
+                function finish(reachedMetadata) {
+                    if (_settled) return;
+                    _settled = true;
+                    clearTimeout(_backstop);
+                    audio.removeEventListener('loadedmetadata', _onMeta);
+                    audio.removeEventListener('error', _onErr);
+                    if (reachedMetadata) {
+                        resumeAtPos();             // resumeAtPos releases suppression
+                    } else {
+                        _releaseSuppression();     // no resume — just release
+                    }
+                }
+                audio.addEventListener('loadedmetadata', _onMeta, { once: true });
+                audio.addEventListener('error', _onErr, { once: true });
+                // 10s is well beyond a normal local-file metadata load.
+                _backstop = setTimeout(() => { finish(false); }, 10000);
+            }
+        } finally {
+            // resumeAtPos owns the release once scheduled; if we returned
+            // early (stale, before scheduling) release here instead.
+            // _releaseSuppression is idempotent so an overlap is harmless.
+            if (!_resumeScheduled) _releaseSuppression();
+        }
+        try {
+            const apply = window.slopsmith?.audio?.applySongVolume;
+            if (typeof apply === 'function') await apply();
+        } catch (_) { /* best-effort */ }
+        console.log('[juce-reroute] JUCE → HTML5 @', pos.toFixed(2), 's playing=', wasPlaying);
+    }
+
+    async function _reevaluateJuceRouting() {
+        if (_rerouteInFlight) return;
+        const songAudio = window._currentSongAudio;
+        // Only /audio/ songs are JUCE-routable; sloppak stems stay on HTML5.
+        if (!songAudio || !songAudio.juceEligible) return;
+        // Don't race highway.js's own initial song-load routing: it owns
+        // _juceMode until _juceRoutingPromise settles. Re-running our switch
+        // concurrently would double-call loadBackingTrack for the same URL.
+        if (window._highwayJuceRoutingPending) return;
+
+        // Claim the in-flight guard SYNCHRONOUSLY, before the first await. The
+        // watcher is driven by a 350ms setInterval; if isAudioRunning() (or any
+        // later await) stalls past the poll period, a second tick would
+        // otherwise pass the `if (_rerouteInFlight) return` check above and run
+        // a concurrent switch — duplicate loadBackingTrack IPCs racing on
+        // _juceMode / audio.src. Setting it here closes that window.
+        _rerouteInFlight = true;
+        try {
+            let running;
+            try { running = await juceApi.isAudioRunning(); }
+            catch (_) { return; }
+            if (_isStale(songAudio)) return;               // song changed during IPC
+            if (!!running === !!window._juceMode) return;  // routing already consistent
+
+            const wantJuce = running && !window._juceMode;
+            // Don't keep retrying a track JUCE explicitly rejected.
+            if (wantJuce && songAudio.url === _rerouteRejectedUrl) return;
+
+            if (running) {
+                const outcome = await _switchHtml5ToJuce(songAudio);
+                // Memoise ONLY an explicit hard JUCE reject. A successful
+                // switch clears the memo; a 'stale' abort (song changed
+                // mid-flight) leaves it untouched — it must never be
+                // misclassified as a reject, even if the song object was
+                // swapped and then restored before this point.
+                if (outcome === 'rejected') {
+                    _rerouteRejectedUrl = songAudio.url;
+                } else if (outcome === 'switched') {
+                    _rerouteRejectedUrl = null;
+                }
+                // outcome === 'stale': leave _rerouteRejectedUrl as-is.
+            } else {
+                await _switchJuceToHtml5(songAudio);
+                // The engine just stopped. Clear any hard-reject memo so a
+                // later engine restart re-evaluates the track at least once —
+                // the rejection may have been a transient device/decoder state.
+                _rerouteRejectedUrl = null;
+            }
+        } catch (e) {
+            // Transient failure — log but do NOT memoise, so the next poll retries.
+            console.warn('[juce-reroute] re-route failed (will retry):', e);
+        } finally {
+            _rerouteInFlight = false;
+        }
+    }
+    window._reevaluateJuceRouting = _reevaluateJuceRouting;
+
+    // Clears the hard-reject memo. Called from the song-teardown sites that
+    // null window._currentSongAudio (showScreen, playSong) so that reloading
+    // the same file later gets a fresh routing attempt — a prior reject may
+    // have been a transient JUCE/device state, not a permanent codec issue.
+    window._clearJuceRerouteMemo = function () { _rerouteRejectedUrl = null; };
+
+    // The engine can be started/stopped from several places (the desktop Audio
+    // Engine panel, the audio_engine plugin, note_detect) and via setDevice
+    // restarts — and the contextBridge api object is frozen, so its methods
+    // can't be wrapped. Poll isAudioRunning() while a song is loaded; the check
+    // is a cheap IPC boolean and no-ops once routing is already consistent.
+    // Skip the poll while the document is hidden (background tab / minimised
+    // window) — engine toggles there will be reconciled on the first poll
+    // after the tab is visible again.
+    setInterval(() => {
+        if (document.hidden) return;
+        if (window._currentSongAudio) void _reevaluateJuceRouting();
+    }, 350);
+})();
+
 // Desktop JUCE backing uses an empty <audio> element; plugins such as Section Map
 // still seek via audio.currentTime / pause / play. Mirror those onto jucePlayer
 // while _juceMode is active. Same-tick pause+seek coalesce into a single seek
@@ -3228,7 +3539,14 @@ audio.addEventListener('loadedmetadata', () => {
 });
 
 // Debug audio issues
-audio.addEventListener('pause', () => { if (isPlaying) console.log('Audio paused unexpectedly at', audio.currentTime.toFixed(1)); });
+audio.addEventListener('pause', () => {
+    // The JUCE engine-reroute watcher pauses the element on purpose mid-migration
+    // (and the src='' it does fires a trailing async pause too); don't flag those
+    // as unexpected — the watcher holds window._juceRerouteInProgress across it.
+    if (isPlaying && !window._juceRerouteInProgress) {
+        console.log('Audio paused unexpectedly at', audio.currentTime.toFixed(1));
+    }
+});
 audio.addEventListener('error', (e) => {
     // Ignore errors from empty src (happens during song switch cleanup)
     if (!audio.src || audio.src === window.location.href) return;
@@ -3243,11 +3561,18 @@ audio.addEventListener('ended', () => {
     window.slopsmith.emit('song:ended', _songEventPayload());
 });
 audio.addEventListener('play', () => {
+    // During a JUCE engine reroute the element is paused/played as a transparent
+    // migration step — playback genuinely continues, so don't emit song:play or
+    // flip slopsmith.isPlaying (the watcher keeps the canonical state itself).
+    if (window._juceRerouteInProgress) return;
     window.slopsmith.isPlaying = true;
     window.slopsmith.emit('song:play', _songEventPayload());
 });
 audio.addEventListener('pause', () => {
     if (!isPlaying) return;
+    // Same as above: suppress the song:pause emitted by a reroute's deliberate
+    // audio.pause() — the migration is transparent to plugin play-state.
+    if (window._juceRerouteInProgress) return;
     window.slopsmith.isPlaying = false;
     window.slopsmith.emit('song:pause', _songEventPayload());
 });
@@ -3293,6 +3618,10 @@ async function playSong(filename, arrangement) {
     }
     audio.pause();
     audio.src = '';
+    // Stale until the incoming song's WS handler (highway.js) sets it again.
+    window._currentSongAudio = null;
+    // Fresh JUCE routing attempt for whatever song loads next.
+    window._clearJuceRerouteMemo?.();
     isPlaying = false;
     document.getElementById('btn-play').textContent = '▶ Play';
     document.getElementById('speed-slider').value = 100;
