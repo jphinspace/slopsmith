@@ -37,6 +37,35 @@
     </div>
 </div>
 
+<div role="group" aria-labelledby="h3d-fretboard-heading" class="mt-6">
+    <h3 id="h3d-fretboard-heading" class="text-sm font-medium text-gray-400 mb-2">3D Highway — Fretboard</h3>
+
+    <!-- Fret spacing -->
+    <div class="mt-3">
+        <label for="h3d-fret-spacing" class="text-xs font-medium text-gray-400 mb-1 block">Fret spacing</label>
+        <select id="h3d-fret-spacing"
+            onchange="window.h3dSetFretSpacing && window.h3dSetFretSpacing(this.value)"
+            class="w-full bg-dark-700 border border-gray-800 rounded-lg px-3 py-2 text-xs text-gray-300 outline-none">
+            <option value="uniform">Uniform (equal width per fret — Rocksmith style)</option>
+            <option value="logarithmic">Instrument (logarithmic — decreasing toward bridge)</option>
+        </select>
+        <p class="text-xs text-gray-500 mt-1">The page will reload when changed.</p>
+    </div>
+
+    <script>
+    (function () {
+        const sel = document.getElementById('h3d-fret-spacing');
+        if (sel) {
+            try {
+                sel.value = localStorage.getItem('highway_3d.fretSpacing') === 'logarithmic' ? 'logarithmic' : 'uniform';
+            } catch (_) {
+                sel.value = 'uniform';
+            }
+        }
+    })();
+    </script>
+</div>
+
 <div role="group" aria-labelledby="h3d-bg-heading" class="mt-6">
     <h3 id="h3d-bg-heading" class="text-sm font-medium text-gray-400 mb-2">3D Highway — Background</h3>
     <p class="text-xs text-gray-500 mb-3">
