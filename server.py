@@ -16,7 +16,7 @@ configure_logging()
 
 log = logging.getLogger("slopsmith.server")
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -683,6 +683,160 @@ class MetadataDB:
 meta_db = MetadataDB()
 
 
+class LocalLibraryProvider:
+    id = "local"
+    label = "My Library"
+    kind = "local"
+    capabilities = (
+        "library.read",
+        "art.read",
+        "song.play",
+        "favorite.write",
+        "metadata.write",
+        "retune.write",
+    )
+
+    def __init__(self, db: MetadataDB):
+        self._db = db
+
+    def query_page(self, **kwargs) -> tuple[list[dict], int]:
+        return self._db.query_page(**kwargs)
+
+    def query_artists(self, **kwargs) -> tuple[list[dict], int]:
+        return self._db.query_artists(**kwargs)
+
+    def query_stats(self, **kwargs) -> dict:
+        return self._db.query_stats(**kwargs)
+
+    def tuning_names(self) -> dict:
+        rows = self._db.conn.execute(
+            "SELECT tuning_name, MIN(tuning_sort_key), COUNT(*) "
+            "FROM songs WHERE title != '' AND COALESCE(tuning_name, '') != '' "
+            "GROUP BY tuning_name COLLATE NOCASE "
+            "ORDER BY ABS(COALESCE(MIN(tuning_sort_key), 0)), "
+            "COALESCE(MIN(tuning_sort_key), 0) ASC, "
+            "tuning_name COLLATE NOCASE"
+        ).fetchall()
+        return {
+            "tunings": [
+                {"name": name, "sort_key": int(sk or 0), "count": count}
+                for name, sk, count in rows
+            ],
+        }
+
+
+class LibraryProviderRegistry:
+    _REQUIRED_METHODS = ("query_page", "query_artists", "query_stats", "tuning_names")
+    _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+
+    def __init__(self):
+        self._providers: dict[str, object] = {}
+        self._lock = threading.RLock()
+
+    def register(self, provider: object, *, replace: bool = False) -> object:
+        provider_id = self.provider_id(provider)
+        if not self._ID_RE.match(provider_id):
+            raise ValueError(
+                "library provider id must start with an alphanumeric character "
+                "and contain only letters, digits, _, ., :, or -"
+            )
+        if not self.provider_label(provider):
+            raise ValueError("library provider label must be a non-empty string")
+        for method_name in self._REQUIRED_METHODS:
+            if not callable(self.provider_method(provider, method_name)):
+                raise TypeError(f"library provider {provider_id!r} is missing callable {method_name}()")
+        with self._lock:
+            if provider_id == "local" and provider_id in self._providers and self._providers[provider_id] is not provider:
+                raise ValueError("the local library provider cannot be replaced")
+            if provider_id in self._providers and not replace:
+                raise ValueError(f"library provider {provider_id!r} is already registered")
+            self._providers[provider_id] = provider
+        return provider
+
+    def unregister(self, provider_id: str) -> bool:
+        if provider_id == "local":
+            raise ValueError("the local library provider cannot be unregistered")
+        with self._lock:
+            return self._providers.pop(provider_id, None) is not None
+
+    def get(self, provider_id: str = "local") -> object | None:
+        with self._lock:
+            return self._providers.get(provider_id or "local")
+
+    def list(self) -> list[dict]:
+        with self._lock:
+            providers = list(self._providers.values())
+        return [self.describe(provider) for provider in providers]
+
+    def describe(self, provider: object) -> dict:
+        provider_id = self.provider_id(provider)
+        return {
+            "id": provider_id,
+            "label": self.provider_label(provider),
+            "kind": self.provider_field(provider, "kind", "local" if provider_id == "local" else "remote"),
+            "capabilities": sorted(self.provider_capabilities(provider)),
+            "default": provider_id == "local",
+        }
+
+    def provider_field(self, provider: object, name: str, default=None):
+        if isinstance(provider, dict):
+            return provider.get(name, default)
+        return getattr(provider, name, default)
+
+    def provider_id(self, provider: object) -> str:
+        provider_id = self.provider_field(provider, "id", "")
+        if not isinstance(provider_id, str) or not provider_id:
+            raise ValueError("library provider id must be a non-empty string")
+        return provider_id
+
+    def provider_label(self, provider: object) -> str:
+        label = self.provider_field(provider, "label", self.provider_field(provider, "name", ""))
+        if not isinstance(label, str):
+            return ""
+        return label.strip()
+
+    def provider_capabilities(self, provider: object) -> set[str]:
+        raw = self.provider_field(provider, "capabilities", ())
+        if raw is None:
+            return set()
+        return {str(cap) for cap in raw if cap}
+
+    def provider_method(self, provider: object, name: str):
+        if isinstance(provider, dict):
+            return provider.get(name)
+        return getattr(provider, name, None)
+
+
+library_providers = LibraryProviderRegistry()
+library_providers.register(LocalLibraryProvider(meta_db))
+
+
+def register_library_provider(provider: object, *, replace: bool = False) -> object:
+    return library_providers.register(provider, replace=replace)
+
+
+def unregister_library_provider(provider_id: str) -> bool:
+    return library_providers.unregister(provider_id)
+
+
+def _get_library_provider(provider: str = "local") -> object:
+    library_provider = library_providers.get(provider or "local")
+    if library_provider is None:
+        raise HTTPException(status_code=404, detail=f"Unknown library provider: {provider}")
+    return library_provider
+
+
+def _call_library_provider(provider: object, method_name: str, **kwargs):
+    method = library_providers.provider_method(provider, method_name)
+    if not callable(method):
+        provider_id = library_providers.provider_id(provider)
+        raise HTTPException(
+            status_code=501,
+            detail=f"Library provider {provider_id!r} does not support {method_name}",
+        )
+    return method(**kwargs)
+
+
 def _get_dlc_dir(cfg: dict | None = None) -> Path | None:
     # Only consider DLC_DIR if the env var was non-empty. `Path("")` collapses
     # to `.` and reports `.is_dir() == True`, which would silently shadow the
@@ -1342,6 +1496,9 @@ async def startup_events():
         "get_dlc_dir": _get_dlc_dir,
         "extract_meta": _extract_meta_for_file,
         "meta_db": meta_db,
+        "library_providers": library_providers,
+        "register_library_provider": register_library_provider,
+        "unregister_library_provider": unregister_library_provider,
         "get_sloppak_cache_dir": lambda: SLOPPAK_CACHE_DIR,
         "register_demo_janitor_hook": register_demo_janitor_hook,
     }
@@ -2209,24 +2366,52 @@ def _parse_has_lyrics(raw: str) -> int | None:
     return None
 
 
+def _library_filter_args(q: str = "", favorites: int = 0, format: str = "",
+                         arrangements_has: str = "", arrangements_lacks: str = "",
+                         stems_has: str = "", stems_lacks: str = "",
+                         has_lyrics: str = "", tunings: str = "") -> dict:
+    fmt = format if format in ("psarc", "sloppak", "loose") else ""
+    return {
+        "q": q,
+        "favorites_only": bool(favorites),
+        "format_filter": fmt,
+        "arrangements_has": _split_csv(arrangements_has),
+        "arrangements_lacks": _split_csv(arrangements_lacks),
+        "stems_has": _split_csv(stems_has),
+        "stems_lacks": _split_csv(stems_lacks),
+        "has_lyrics": _parse_has_lyrics(has_lyrics),
+        "tunings": _split_csv(tunings),
+    }
+
+
+@app.get("/api/library/providers")
+def list_library_providers():
+    """List registered library providers."""
+    return {"providers": library_providers.list()}
+
+
 @app.get("/api/library")
 def list_library(q: str = "", page: int = 0, size: int = 24, sort: str = "artist",
                  dir: str = "asc", favorites: int = 0, format: str = "",
                  arrangements_has: str = "", arrangements_lacks: str = "",
                  stems_has: str = "", stems_lacks: str = "",
-                 has_lyrics: str = "", tunings: str = ""):
-    """Paginated library search, queried from SQLite."""
+                 has_lyrics: str = "", tunings: str = "", provider: str = "local"):
+    """Paginated library search through the selected library provider."""
     size = min(size, 100)
-    fmt = format if format in ("psarc", "sloppak", "loose") else ""
-    songs, total = meta_db.query_page(
-        q=q, page=page, size=size, sort=sort,
-        direction=dir, favorites_only=bool(favorites), format_filter=fmt,
-        arrangements_has=_split_csv(arrangements_has),
-        arrangements_lacks=_split_csv(arrangements_lacks),
-        stems_has=_split_csv(stems_has),
-        stems_lacks=_split_csv(stems_lacks),
-        has_lyrics=_parse_has_lyrics(has_lyrics),
-        tunings=_split_csv(tunings),
+    library_provider = _get_library_provider(provider)
+    songs, total = _call_library_provider(
+        library_provider,
+        "query_page",
+        page=page,
+        size=size,
+        sort=sort,
+        direction=dir,
+        **_library_filter_args(
+            q=q, favorites=favorites, format=format,
+            arrangements_has=arrangements_has, arrangements_lacks=arrangements_lacks,
+            stems_has=stems_has, stems_lacks=stems_lacks,
+            has_lyrics=has_lyrics, tunings=tunings,
+        ),
     )
     return {"songs": songs, "total": total, "page": page, "size": size}
 
@@ -2236,18 +2421,21 @@ def list_artists(letter: str = "", q: str = "", favorites: int = 0, page: int = 
                  format: str = "",
                  arrangements_has: str = "", arrangements_lacks: str = "",
                  stems_has: str = "", stems_lacks: str = "",
-                 has_lyrics: str = "", tunings: str = ""):
+                 has_lyrics: str = "", tunings: str = "", provider: str = "local"):
     """Get artists grouped by letter with albums and songs (for tree view)."""
-    fmt = format if format in ("psarc", "sloppak", "loose") else ""
-    artists, total = meta_db.query_artists(
-        letter=letter, q=q, favorites_only=bool(favorites),
-        page=page, size=min(size, 100), format_filter=fmt,
-        arrangements_has=_split_csv(arrangements_has),
-        arrangements_lacks=_split_csv(arrangements_lacks),
-        stems_has=_split_csv(stems_has),
-        stems_lacks=_split_csv(stems_lacks),
-        has_lyrics=_parse_has_lyrics(has_lyrics),
-        tunings=_split_csv(tunings),
+    library_provider = _get_library_provider(provider)
+    artists, total = _call_library_provider(
+        library_provider,
+        "query_artists",
+        letter=letter,
+        page=page,
+        size=min(size, 100),
+        **_library_filter_args(
+            q=q, favorites=favorites, format=format,
+            arrangements_has=arrangements_has, arrangements_lacks=arrangements_lacks,
+            stems_has=stems_has, stems_lacks=stems_lacks,
+            has_lyrics=has_lyrics, tunings=tunings,
+        ),
     )
     return {"artists": artists, "total_artists": total, "page": page, "size": size}
 
@@ -2256,51 +2444,30 @@ def list_artists(letter: str = "", q: str = "", favorites: int = 0, page: int = 
 def library_stats(favorites: int = 0, q: str = "", format: str = "",
                   arrangements_has: str = "", arrangements_lacks: str = "",
                   stems_has: str = "", stems_lacks: str = "",
-                  has_lyrics: str = "", tunings: str = ""):
+                  has_lyrics: str = "", tunings: str = "", provider: str = "local"):
     """Aggregate stats for the UI. Accepts the same filter params as
     /api/library so the letter bar mirrors the active grid filter set."""
-    fmt = format if format in ("psarc", "sloppak", "loose") else ""
-    return meta_db.query_stats(
-        favorites_only=bool(favorites), q=q, format_filter=fmt,
-        arrangements_has=_split_csv(arrangements_has),
-        arrangements_lacks=_split_csv(arrangements_lacks),
-        stems_has=_split_csv(stems_has),
-        stems_lacks=_split_csv(stems_lacks),
-        has_lyrics=_parse_has_lyrics(has_lyrics),
-        tunings=_split_csv(tunings),
+    library_provider = _get_library_provider(provider)
+    return _call_library_provider(
+        library_provider,
+        "query_stats",
+        **_library_filter_args(
+            q=q, favorites=favorites, format=format,
+            arrangements_has=arrangements_has, arrangements_lacks=arrangements_lacks,
+            stems_has=stems_has, stems_lacks=stems_lacks,
+            has_lyrics=has_lyrics, tunings=tunings,
+        ),
     )
 
 
 @app.get("/api/library/tuning-names")
-def list_tuning_names():
+def list_tuning_names(provider: str = "local"):
     """Distinct tuning names present in the library, with per-tuning
     counts. Powers the tuning multi-select. Sorted by `tuning_sort_key`
     so names appear in the same musical order the sort uses
     (slopsmith#22) — E Standard first, then nearest neighbors."""
-    rows = meta_db.conn.execute(
-        "SELECT tuning_name, MIN(tuning_sort_key), COUNT(*) "
-        # NULL/empty-name rows are excluded entirely from the picker —
-        # users can't usefully filter by an unknown tuning. Once they
-        # rescan, the rows acquire a name and join the list.
-        "FROM songs WHERE title != '' AND COALESCE(tuning_name, '') != '' "
-        "GROUP BY tuning_name COLLATE NOCASE "
-        # Same ordering as `sort=tuning` in `query_page`: distance
-        # from E Standard first, then signed-key ASC so the down-
-        # tuned variant precedes the up-tuned one at equal distance
-        # (Eb Standard before F Standard at distance 6). Final
-        # alphabetical tiebreak keeps the order deterministic.
-        # COALESCE around the sort_key guards against NULL the same
-        # way the main tuning sort does.
-        "ORDER BY ABS(COALESCE(MIN(tuning_sort_key), 0)), "
-        "COALESCE(MIN(tuning_sort_key), 0) ASC, "
-        "tuning_name COLLATE NOCASE"
-    ).fetchall()
-    return {
-        "tunings": [
-            {"name": name, "sort_key": int(sk or 0), "count": count}
-            for name, sk, count in rows
-        ],
-    }
+    library_provider = _get_library_provider(provider)
+    return _call_library_provider(library_provider, "tuning_names")
 
 
 @app.post("/api/favorites/toggle")
