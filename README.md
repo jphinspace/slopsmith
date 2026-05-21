@@ -416,6 +416,7 @@ Routes are registered under `/api/plugins/{plugin_id}/` to avoid conflicts.
 | [Update Manager](https://github.com/masc0t/slopsmith-update-manager)                | Installs, updates, and uninstalls other plugins and the slopsmith core itself   | `git clone ...slopsmith-update-manager.git update_manager`              |
 | [Tuner](https://github.com/OmikronApex/slopsmith-plugin-tuner)                      | Floating tuner with customizable tunings   | `git clone ...slopsmith-plugin-tuner.git tuner`                         |
 | [Simplify Chords](https://github.com/bkranendonk/slopsmith-plugin-simplify-chords)  | Changes complex chords on the note highway to simpler ones. Inspired by Ultimate Guitar's Simplify button. | `git clone ...slopsmith-plugin-simplify-chords.git simplify-chords`     |
+| [Key Bindings](https://github.com/jackipicco/slopsmith-plugin-key-bindings)  | Highway key bindings for keyboard and TV remote| `git clone ...slopsmith-plugin-key-bindings.git key_bindings`     |
 
 
 Install any plugin by cloning it into your `plugins/` directory and restarting:
