@@ -31,6 +31,7 @@ from song import (
     Section,
     arrangement_from_wire,
 )
+import drums as drums_mod
 
 
 # ── Format detection ──────────────────────────────────────────────────────────
@@ -155,6 +156,12 @@ class LoadedSloppak:
     stems: list[dict]           # [{"id": str, "file": str, "default": bool}]
     source_dir: Path
     manifest: dict
+    # Parsed `drum_tab.json` payload when the manifest carries a `drum_tab:`
+    # key pointing at a readable, schema-valid file. None otherwise (older
+    # sloppaks, sloppaks without drums, sloppaks whose drum tab failed to
+    # parse). The drums plugin reads this through the highway WS rather than
+    # the file directly — see server.py highway_ws for the wire shape.
+    drum_tab: dict | None = None
 
 
 def load_song(
@@ -217,6 +224,41 @@ def load_song(
                 )
         song.arrangements.append(arr)
 
+    # Optional drum_tab.json — top-level manifest key per sloppak-spec §5.3.
+    # The file lives off to the side (its own JSON), and the manifest opts in
+    # via `drum_tab: drum_tab.json`. The loader stays permissive: a missing file
+    # silently disables drum playback; a malformed or invalid tab disables it
+    # with a warning.
+    drum_tab_data: dict | None = None
+    drum_tab_rel = manifest.get("drum_tab")
+    if isinstance(drum_tab_rel, str) and drum_tab_rel:
+        # Constrain to source_dir to prevent a crafted manifest from reading
+        # files outside the sloppak directory via path traversal (e.g. ../../etc).
+        # Wrap both resolve() calls in a broad handler: symlink loops and
+        # permission errors on .resolve() should disable drums, not abort load.
+        try:
+            dt_path = (source_dir / drum_tab_rel).resolve()
+            dt_path.relative_to(source_dir.resolve())
+        except ValueError:
+            log.warning("sloppak: drum_tab path %r escapes source_dir — skipped", drum_tab_rel)
+            dt_path = None
+        except OSError as e:
+            log.warning("sloppak: drum_tab path resolution failed (%s) — skipped", e)
+            dt_path = None
+        if dt_path is not None and dt_path.exists():
+            try:
+                raw = json.loads(dt_path.read_text(encoding="utf-8"))
+            except Exception as e:
+                log.warning("sloppak: failed to parse drum_tab %r: %s", drum_tab_rel, e)
+                raw = None
+            if raw is not None:
+                ok, reason = drums_mod.validate_drum_tab(raw)
+                if ok:
+                    drum_tab_data = raw
+                else:
+                    log.warning("sloppak: drum_tab %r failed validation: %s",
+                                drum_tab_rel, reason)
+
     # Optional shared lyrics file.
     lyrics_rel = manifest.get("lyrics")
     if lyrics_rel:
@@ -244,7 +286,13 @@ def load_song(
             default_on = bool(default_val)
         stems.append({"id": sid, "file": sfile, "default": default_on})
 
-    return LoadedSloppak(song=song, stems=stems, source_dir=source_dir, manifest=manifest)
+    return LoadedSloppak(
+        song=song,
+        stems=stems,
+        source_dir=source_dir,
+        manifest=manifest,
+        drum_tab=drum_tab_data,
+    )
 
 
 # ── Fast metadata extractor (scanner path) ────────────────────────────────────

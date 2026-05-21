@@ -35,6 +35,7 @@ from song import (
 from audio import find_wem_files, convert_wem
 from tunings import tuning_name
 import sloppak as sloppak_mod
+import drums as drums_mod
 import loosefolder as loosefolder_mod
 
 import concurrent.futures
@@ -3992,7 +3993,44 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
             "offset": _sanitized_song_offset(song) if is_loose else 0.0,
             "format": "sloppak" if is_slop else ("loose" if is_loose else "psarc"),
             "stems": stems_payload,
+            # Surface a drum_tab presence flag so the visualization picker
+            # can auto-activate the drums plugin even when the chosen
+            # arrangement isn't named "Drums" (drum_tab.json lives next
+            # to the manifest, not inside the arrangements list).
+            "has_drum_tab": bool(
+                is_slop and loaded_slop is not None and loaded_slop.drum_tab is not None
+            ),
         })
+
+        # Send drum_tab when the sloppak ships one (manifest `drum_tab:` key,
+        # see lib/sloppak.py). The drums plugin subscribes to `drum_tab` for
+        # the kit legend and `drum_hits` for the timed hit stream. Chunked
+        # 500-per-frame like notes so a long song stays well under WS frame
+        # limits. Legacy drum sloppaks (drums encoded as guitar notes) skip
+        # this branch and fall through to the regular `notes` stream — the
+        # client-side drums plugin keeps a fallback decoder for them.
+        if is_slop and loaded_slop is not None and loaded_slop.drum_tab is not None:
+            dt = loaded_slop.drum_tab
+            kit = drums_mod.normalise_kit(dt.get("kit"))
+            hits_wire = drums_mod.hits_to_wire(dt.get("hits") or [])
+            _dt_name = dt.get("name")
+            _dt_name = _dt_name if isinstance(_dt_name, str) and _dt_name else "Drums"
+            try:
+                await websocket.send_json({
+                    "type": "drum_tab",
+                    "version": int(dt.get("version", drums_mod.SCHEMA_VERSION)),
+                    "name": _dt_name,
+                    "kit": kit,
+                    "total": len(hits_wire),
+                })
+                for i in range(0, len(hits_wire), 500):
+                    await websocket.send_json({
+                        "type": "drum_hits",
+                        "data": hits_wire[i:i + 500],
+                        "total": len(hits_wire),
+                    })
+            except WebSocketDisconnect:
+                return
 
         # Send beats
         beats = [{"time": b.time, "measure": b.measure} for b in song.beats]

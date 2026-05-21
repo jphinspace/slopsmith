@@ -1,18 +1,29 @@
-"""MIDI file import — list tracks and convert a track to a Keys arrangement.
+"""MIDI file import — list tracks and convert tracks to sloppak payloads.
 
-Mirrors the shape of lib/gp2rs.py so the editor's track-picker UI can use
-the same flow for both GP and MIDI files. Drum tracks (GM channel 9) are
-filtered out of the listing entirely — the keys-import converter
-unconditionally skips channel-9 events so a drums entry would always yield
-an empty arrangement, and there is no MIDI drum-import flow today.
+Two parallel flows live here:
+
+- **Keys path** (`list_midi_tracks` + `convert_midi_track_to_keys_wire`):
+  filters channel-9 out and emits a standard guitar-style arrangement that
+  the piano plugin decodes via `midi = string * 24 + fret`.
+
+- **Drums path** (`list_drum_tracks` + `convert_drum_track_from_midi`):
+  keeps channel-9 only and emits the `drum_tab.json` shape documented in
+  `docs/sloppak-spec.md` §5.3, ready to drop alongside the sloppak
+  manifest's `drum_tab:` key.
+
+The editor's track picker uses both for the +Drums and +Keys modals.
 """
 
 from __future__ import annotations
 
+import math
 from bisect import bisect_right
 from collections import deque
+from typing import Callable
 
 import mido
+
+import drums as drums_mod
 
 
 # General MIDI piano-family programs (0-7) plus chromatic percussion + organ.
@@ -39,10 +50,10 @@ def list_midi_tracks(midi_path: str) -> list[dict]:
     channels would otherwise lose half its notes when the user picked
     just one of the split entries with no way to recover the merged form.
 
-    Drum (channel-9) channels are dropped from the listing entirely —
-    the keys-import converter unconditionally skips channel-9 events,
-    so a drums entry would yield an empty arrangement, and there's no
-    MIDI drum-import flow today.
+    Drum (channel-9) channels are dropped from the listing here — the
+    keys-import converter unconditionally skips channel-9 events, so a
+    drums entry would yield an empty arrangement. Use `list_drum_tracks`
+    + `convert_drum_track_from_midi` for the MIDI drum-import flow.
 
     Each item: {index, name, instrument, notes, channel, is_piano, is_drums,
     channel_filter}. For split entries `channel_filter` is set; for
@@ -328,4 +339,268 @@ def convert_midi_track_to_keys_wire(
         "anchors": [],
         "handshapes": [],
         "templates": [],
+    }
+
+
+# ── Tempo + drum-import shared helpers ───────────────────────────────────────
+
+def _build_tick_to_seconds(midi: mido.MidiFile, track_index: int) -> Callable[[int], float]:
+    """Return an `(abs_tick) -> seconds` function for the chosen track.
+
+    Tempo-event scope depends on the SMF format (mirrors the keys converter):
+      - type 0: single track holds tempo + notes; walk it alone.
+      - type 1: parallel tracks share the timeline; merge tempo events.
+      - type 2: independent timelines; tempo only from the chosen track.
+    """
+    ticks_per_beat = midi.ticks_per_beat
+    raw_events: list[tuple[int, int]] = [(0, 500000)]  # default 120 BPM
+    midi_type = getattr(midi, "type", 1)
+    tempo_source = (
+        [midi.tracks[track_index]] if midi_type == 2 else midi.tracks
+    )
+    for tr in tempo_source:
+        abs_tick = 0
+        for msg in tr:
+            abs_tick += msg.time
+            if msg.type == "set_tempo":
+                raw_events.append((abs_tick, int(msg.tempo)))
+    raw_events.sort(key=lambda e: e[0])
+    deduped: list[tuple[int, int]] = []
+    for ev in raw_events:
+        if deduped and deduped[-1][0] == ev[0]:
+            deduped[-1] = ev
+        else:
+            deduped.append(ev)
+
+    tempo_table: list[tuple[int, float, int]] = []
+    cum_seconds = 0.0
+    prev_tick = 0
+    prev_tempo = deduped[0][1]
+    for ev_tick, ev_tempo in deduped:
+        cum_seconds += (ev_tick - prev_tick) * (prev_tempo / 1_000_000.0) / ticks_per_beat
+        tempo_table.append((ev_tick, cum_seconds, ev_tempo))
+        prev_tick = ev_tick
+        prev_tempo = ev_tempo
+    tempo_ticks = [row[0] for row in tempo_table]
+
+    def tick_to_seconds(tick: int) -> float:
+        i = bisect_right(tempo_ticks, tick) - 1
+        if i < 0:
+            i = 0
+        base_tick, base_seconds, tempo = tempo_table[i]
+        return base_seconds + (tick - base_tick) * (tempo / 1_000_000.0) / ticks_per_beat
+
+    return tick_to_seconds
+
+
+# ── Drum track listing (channel-9 only) ──────────────────────────────────────
+
+# Velocity below this is treated as a ghost note. GM doesn't have an explicit
+# ghost flag; chartists encode dynamics through velocity. 40 is the same
+# threshold the drums plugin uses for ghost-note styling.
+_GHOST_VELOCITY = 40
+
+# Two hits on the same piece closer together than this are interpreted as a
+# flam (the later one carries `f: true`). 30 ms matches the drums plugin's
+# leading-glyph offset for flam rendering.
+_FLAM_WINDOW_S = 0.030
+
+# A cymbal note whose explicit note-off arrives within this window after the
+# note-on is treated as a choke (the chartist clamped the cymbal). 120 ms
+# matches the spec's mention of choke tail durations.
+_CHOKE_MAX_S = 0.120
+
+
+def list_drum_tracks(midi_path: str) -> list[dict]:
+    """List tracks that contain GM channel-9 (percussion) note_on events.
+
+    For format-0 files (everything in one track, channels intermixed), this
+    surfaces the lone track once when it has channel-9 hits. For format-1/2
+    files, each track that fires channel-9 notes shows up. Mirrors
+    `list_midi_tracks` so the editor's +Drums modal can show the same shape
+    of picker entry the +Keys modal does.
+
+    Each item: {index, name, instrument, notes, channel, is_piano,
+    is_drums, strings, is_percussion, channel_filter} — the same
+    picker-entry shape `list_midi_tracks` emits, so the editor frontend
+    can consume either list uniformly. For drum tracks the classification
+    fields are fixed: `is_drums`/`is_percussion` True, `is_piano` False,
+    `instrument` -1, `strings` 0. `channel_filter` is always 9 — the
+    converter uses it to skip non-drum events on a mixed-channel track.
+    """
+    midi = mido.MidiFile(midi_path)
+    out: list[dict] = []
+    for i, track in enumerate(midi.tracks):
+        name = ""
+        note_count = 0
+        for msg in track:
+            if msg.type == "track_name" and not name:
+                name = msg.name or ""
+            elif (
+                msg.type == "note_on"
+                and int(getattr(msg, "velocity", 0)) > 0
+                and int(getattr(msg, "channel", -1)) == 9
+            ):
+                note_count += 1
+        if note_count == 0:
+            continue
+        out.append({
+            "index": i,
+            "channel_filter": 9,
+            "name": name or f"Track {i} (drums)",
+            "instrument": -1,
+            "notes": note_count,
+            "channel": 9,
+            "is_piano": False,
+            "is_drums": True,
+            "strings": 0,
+            "is_percussion": True,
+        })
+    return out
+
+
+def convert_drum_track_from_midi(
+    midi_path: str,
+    track_index: int,
+    audio_offset: float = 0.0,
+    name: str = "Drums",
+) -> dict:
+    """Convert a MIDI drum track to a `drum_tab.json` dict.
+
+    Reads channel-9 note_on events on the chosen track, maps each MIDI note
+    to a piece-id via `lib.drums.midi_to_piece`, and emits hits with
+    velocity preserved verbatim. Three heuristics encode articulations that
+    GM MIDI doesn't have explicit flags for:
+
+    - **Ghost**: velocity < 40 → `g: true`.
+    - **Flam**: two hits on the same piece within 30 ms → the louder one
+      (the main strike) carries `f: true` and the quieter grace note is
+      dropped (the renderer draws the leading glyph itself from the `f`
+      flag). Typically the grace note arrives first in time, but the
+      heuristic is velocity-based to handle MIDI files where encoding
+      order differs from chronological order.
+    - **Choke**: a cymbal note-off arriving within 120 ms of its note-on
+      sets `k` to the actual on→off duration.
+    """
+    offset = float(audio_offset)
+    if not math.isfinite(offset):
+        raise ValueError(f"audio_offset must be a finite number, got {audio_offset!r}")
+
+    midi = mido.MidiFile(midi_path)
+    if track_index < 0 or track_index >= len(midi.tracks):
+        raise ValueError(f"track_index {track_index} out of range")
+
+    tick_to_seconds = _build_tick_to_seconds(midi, track_index)
+    track = midi.tracks[track_index]
+
+    # Two passes: collect raw note_on/note_off pairs in pass 1 (so we know
+    # each on's actual off time for choke detection), then apply the
+    # flam-collapse + serialisation in pass 2.
+    raw: list[dict] = []  # one entry per note_on
+    # Use list[int] per MIDI note so overlapping/retriggered hits (note_on
+    # before note_off for the same note) are each tracked independently
+    # rather than the later one overwriting the earlier one's index.
+    open_hits: dict[int, deque[int]] = {}  # midi note -> FIFO queue of indices in `raw`
+    abs_tick = 0
+    for msg in track:
+        abs_tick += msg.time
+        if int(getattr(msg, "channel", -1)) != 9:
+            continue
+        if msg.type == "note_on" and int(getattr(msg, "velocity", 0)) > 0:
+            midi_note = int(msg.note)
+            piece = drums_mod.midi_to_piece(midi_note)
+            if piece is None:
+                continue
+            t = tick_to_seconds(abs_tick) + offset
+            # Keep full-precision seconds for flam-window comparisons; round
+            # only when serialising to the final wire hit below.
+            raw.append({
+                "t": t,
+                "p": piece,
+                "v": int(msg.velocity),
+                "_midi": midi_note,
+                "_on_tick": abs_tick,
+            })
+            open_hits.setdefault(midi_note, deque()).append(len(raw) - 1)
+        elif msg.type == "note_off" or (
+            msg.type == "note_on" and int(getattr(msg, "velocity", 0)) == 0
+        ):
+            midi_note = int(msg.note)
+            stack = open_hits.get(midi_note)
+            if not stack:
+                continue
+            idx = stack.popleft()  # FIFO: oldest note_on matches this note_off
+            if not stack:
+                del open_hits[midi_note]
+            hit = raw[idx]
+            if drums_mod.piece_category(hit["p"]) != "cymbal":
+                continue
+            on_secs = tick_to_seconds(hit["_on_tick"])
+            off_secs = tick_to_seconds(abs_tick)
+            dur = off_secs - on_secs
+            if 0.0 < dur <= _CHOKE_MAX_S:
+                hit["k"] = round(dur, 3)
+
+    raw.sort(key=lambda h: (h["t"], h["p"]))
+
+    # Flam collapse: for each hit, compare it against the most-recent
+    # previous hit of the SAME piece (not just the globally adjacent entry),
+    # so an intervening hit from a different piece does not break flam
+    # detection for densely-played patterns (e.g. kick + snare flam).
+    flam_indices: set[int] = set()
+    drop_indices: set[int] = set()
+    last_by_piece: dict[str, int] = {}  # piece-id -> index in raw[]
+    for i, curr in enumerate(raw):
+        piece = curr["p"]
+        prev_i = last_by_piece.get(piece)
+        if prev_i is not None and prev_i not in drop_indices:
+            prev = raw[prev_i]
+            if (curr["t"] - prev["t"]) <= _FLAM_WINDOW_S:
+                # Prefer the louder hit as the "main"; the quieter is the
+                # leading grace. The main hit receives `f: true` so the
+                # renderer draws a small grace glyph slightly ahead of it.
+                if prev["v"] <= curr["v"]:
+                    drop_indices.add(prev_i)
+                    flam_indices.add(i)
+                else:
+                    drop_indices.add(i)
+                    flam_indices.add(prev_i)
+                # Don't advance last_by_piece — keep prev_i as anchor so a
+                # triple flam doesn't chain two drops.
+                continue
+        last_by_piece[piece] = i
+
+    out_hits: list[dict] = []
+    for i, hit in enumerate(raw):
+        if i in drop_indices:
+            continue
+        # Round here (not at append time) so flam comparisons above used full precision.
+        new_hit: dict = {"t": round(hit["t"], 3), "p": hit["p"]}
+        vel = hit["v"]
+        if 1 <= vel <= 127:
+            new_hit["v"] = vel
+        if vel < _GHOST_VELOCITY:
+            new_hit["g"] = True
+        if i in flam_indices:
+            new_hit["f"] = True
+        if "k" in hit:
+            new_hit["k"] = hit["k"]
+        out_hits.append(new_hit)
+
+    # Build kit legend from the union of piece-ids that survived.
+    seen_pieces: list[str] = []
+    seen_set: set[str] = set()
+    for h in out_hits:
+        if h["p"] not in seen_set:
+            seen_set.add(h["p"])
+            seen_pieces.append(h["p"])
+
+    return {
+        "version": drums_mod.SCHEMA_VERSION,
+        "name": name,
+        "kit": [
+            {"id": pid, "name": pid.replace("_", " ").title()}
+            for pid in seen_pieces
+        ],
+        "hits": out_hits,
     }

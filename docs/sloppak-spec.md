@@ -396,21 +396,31 @@ Older Slopsmith readers ignore the unknown `drum_tab` key (the loader uses `mani
 
 #### Drum tab
 
-`drum_tab.json` containing per-piece hits:
+`drum_tab.json` carries per-piece hits authored on top of the song's audio.
+Implemented end-to-end as of slopsmith#344 (drums-from-scratch): the loader
+in `lib/sloppak.py` parses it, `lib/drums.py` defines the canonical piece-id
+vocabulary, and `/ws/highway/{filename}` streams it as `drum_tab` + chunked
+`drum_hits` messages.
 
 ```json
 {
   "version": 1,
+  "name": "Drums",
   "kit": [
-    {"id": "kick",    "name": "Kick"},
-    {"id": "snare",   "name": "Snare"},
-    {"id": "hh_open", "name": "Hi-hat (open)"},
-    {"id": "ride",    "name": "Ride"}
+    {"id": "kick",      "name": "Kick"},
+    {"id": "snare",     "name": "Snare"},
+    {"id": "hh_closed", "name": "Hi-hat (closed)"},
+    {"id": "hh_open",   "name": "Hi-hat (open)"},
+    {"id": "crash_r",   "name": "Crash (right)"},
+    {"id": "ride",      "name": "Ride"}
   ],
   "hits": [
-    {"t": 0.500, "p": "kick",  "v": 100},
-    {"t": 0.750, "p": "snare", "v":  88},
-    {"t": 1.000, "p": "hh_open"}
+    {"t": 0.500, "p": "kick",      "v": 110},
+    {"t": 0.750, "p": "snare",     "v":  92},
+    {"t": 0.750, "p": "hh_closed", "v":  70},
+    {"t": 1.000, "p": "snare",     "v":  60, "g": true},
+    {"t": 1.250, "p": "snare",     "v": 105, "f": true},
+    {"t": 4.000, "p": "crash_r",   "v": 120, "k": 0.080}
   ]
 }
 ```
@@ -421,10 +431,68 @@ Manifest:
 drum_tab: drum_tab.json
 ```
 
-Notes on the design:
-- `kit[]` is the legend (which piece IDs exist) — separates fixed metadata from hot-path data.
-- `hits[]` uses short field names (`t`, `p`, `v`) since this list can be thousands long.
-- `v` (velocity) is optional, defaults to 100 — keeps simple charts terse.
+##### Hit fields
+
+| key | type | meaning |
+| --- | --- | --- |
+| `t` | float seconds | hit time, required, monotonic in `hits[]` |
+| `p` | string | piece-id from the closed list below; required |
+| `v` | int 1-127 | velocity (default 100) |
+| `g` | bool | ghost note (renders smaller / outline-only) |
+| `f` | bool | flam (renders a small leading ghost glyph 30 ms early) |
+| `k` | float seconds | cymbal-choke tail duration (renders a fade-out) |
+
+##### Canonical piece-id vocabulary
+
+A closed list lives in `lib/drums.py::PIECES`. Open/closed hi-hat are
+**distinct piece-ids**, not articulation flags — hit detection must reject
+a closed-hat strike on an open-hat note, which it can only do if the
+articulation is part of the piece-id.
+
+| piece-id | category | default GM MIDI | default shape |
+| --- | --- | --- | --- |
+| `kick` | kick | 35, 36 | bar (full-width across all non-kick lanes) |
+| `snare` | drum | 38, 40 | rectangle |
+| `snare_xstick` | drum | 37 | hatched rectangle |
+| `tom_hi` | drum | 50, 48 | rectangle |
+| `tom_mid` | drum | 47, 45 | rectangle |
+| `tom_low` | drum | 43 | rectangle |
+| `tom_floor` | drum | 41 | rectangle |
+| `hh_closed` | cymbal | 42 | filled circle |
+| `hh_open` | cymbal | 46 | ring (outline) circle |
+| `hh_pedal` | cymbal | 44 | small circle with × |
+| `crash_l` | cymbal | 49 | circle |
+| `crash_r` | cymbal | 57 | circle |
+| `splash` | cymbal | 55 | small circle |
+| `china` | cymbal | 52 | jagged circle |
+| `ride` | cymbal | 51, 59 | circle |
+| `ride_bell` | cymbal | 53 | circle with centre dot |
+
+Unknown piece-ids round-trip through the loader (forward-compat); the
+client just renders them as a default rectangle.
+
+##### Wire format
+
+Streamed as two highway-WS message types:
+
+```json
+{ "type": "drum_tab", "version": 1, "name": "Drums",
+  "kit": [{"id": "kick", "name": "Kick"}, ...], "total": 1234 }
+```
+
+…followed by one or more chunks of 500 hits:
+
+```json
+{ "type": "drum_hits", "data": [{"t": 0.5, "p": "kick", "v": 110}, ...],
+  "total": 1234 }
+```
+
+##### Design notes
+
+- `kit[]` is the legend — fixed metadata, separated from hot-path data.
+- `hits[]` uses short field names because this list can be thousands long.
+- `v` defaults to 100; ghost / flam / choke flags are all optional.
+- Older sloppaks whose drums are encoded as guitar notes (`midi = string*24 + fret`) still play — the drums plugin keeps a legacy decoder that reads the standard `notes` stream and synthesises `drum_hits` from it.
 
 #### Key / scale annotations (for theory-aware visualizations)
 

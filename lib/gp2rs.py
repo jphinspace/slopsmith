@@ -1186,7 +1186,7 @@ def convert_piano_track(
                     # In GP, note.value is the fret, and the string tuning
                     # gives the base MIDI value
                     gp_str_idx = note.string  # 1-based in GP
-                    if gp_str_idx <= len(track.strings):
+                    if 1 <= gp_str_idx <= len(track.strings):
                         base_midi = track.strings[gp_str_idx - 1].value
                     else:
                         base_midi = 60  # fallback to middle C
@@ -1367,7 +1367,7 @@ def convert_drum_track(
                     # string tuning value (each "string" = a drum piece).
                     # note.value is the fret (usually 0 for drums).
                     gp_str_idx = note.string  # 1-based
-                    if gp_str_idx <= len(track.strings):
+                    if 1 <= gp_str_idx <= len(track.strings):
                         midi_note = track.strings[gp_str_idx - 1].value + note.value
                     else:
                         midi_note = note.value
@@ -1459,6 +1459,126 @@ def convert_drum_track(
         anchors=anchors,
         tempo=song.tempo,
     )
+
+
+def convert_drum_track_to_drumtab(
+    song: guitarpro.Song,
+    track_index: int,
+    audio_offset: float = 0.0,
+    arrangement_name: str = "Drums",
+    *,
+    expand_repeats: bool = True,
+) -> dict:
+    """Convert a GP drum/percussion track to a `drum_tab.json` dict.
+
+    Returns the payload documented in `docs/sloppak-spec.md` §5.3:
+
+        {"version": 1, "name": str,
+         "kit": [{"id": piece, "name": label}, ...],
+         "hits": [{"t": float, "p": piece, "v": int, "g"?: bool,
+                   "f"?: bool, "k"?: float}, ...]}
+
+    Velocity is preserved verbatim (pyguitarpro uses MIDI 1-127). Ghost notes
+    are surfaced as `g: true` (not as a velocity penalty), flams as `f: true`
+    via `NoteEffect.isGrace`. Hi-hat openness is derived from the MIDI note
+    number (42 closed / 46 open / 44 pedal) since GP stores those on distinct
+    drum strings. Unknown percussion sounds (cowbell, tambourine etc.) are
+    skipped — round-tripping them would require teaching `lib/drums.py` first.
+
+    Honours GP repeat brackets and D.S./D.C./Coda/Fine jumps when
+    ``expand_repeats`` is true — same `_build_playback_schedule` machinery
+    used by the guitar/bass/keys/legacy-drum-XML converters above.
+    """
+    # Imported lazily so an environment without lib/drums.py (older worktree
+    # checkout) still loads gp2rs successfully.
+    import drums as drums_mod
+
+    track = song.tracks[track_index]
+    tempo_map = _build_tempo_map(song)
+    schedule = _build_playback_schedule(song, tempo_map, expand_repeats)
+
+    hits: list[dict] = []
+    pieces_seen: dict[str, str] = {}  # piece-id → display name
+
+    for entry in schedule:
+        measure = track.measures[entry.mh_index]
+        for voice in measure.voices:
+            for beat in voice.beats:
+                if not beat.notes:
+                    continue
+
+                authored_beat_secs = _tick_to_seconds(beat.start, tempo_map)
+                t = (
+                    (authored_beat_secs - entry.mh_authored_start_secs)
+                    + entry.output_start_secs
+                    + audio_offset
+                )
+
+                for note in beat.notes:
+                    if note.type == guitarpro.NoteType.rest:
+                        continue
+
+                    # Percussion tracks: MIDI note is the string's tuning
+                    # value (each "string" pins a drum piece) + fret offset.
+                    gp_str_idx = note.string
+                    if 1 <= gp_str_idx <= len(track.strings):
+                        midi_note = track.strings[gp_str_idx - 1].value + note.value
+                    else:
+                        midi_note = note.value
+
+                    piece = drums_mod.midi_to_piece(midi_note)
+                    if piece is None:
+                        continue  # Unmapped percussion sound; skip silently.
+
+                    hit: dict = {"t": round(t, 3), "p": piece}
+
+                    # Velocity: GP stores 1-127 MIDI velocity directly; default
+                    # is 95 (Velocities.default). Pass through verbatim,
+                    # clamping defensively so a corrupt file can't poison the
+                    # wire format.
+                    vel = int(getattr(note, "velocity", 0) or 0)
+                    if 1 <= vel <= 127:
+                        hit["v"] = vel
+
+                    eff = note.effect
+                    # Ghost — explicit flag on the GP effect. Accent flag is
+                    # already reflected in the higher velocity, so we don't
+                    # need a separate `ac` field on the hit.
+                    if getattr(eff, "ghostNote", False):
+                        hit["g"] = True
+                    # Flam / grace note — pyguitarpro models grace notes as a
+                    # GraceEffect dangling off NoteEffect; `isGrace` is the
+                    # convenience boolean. Drum charts use grace almost
+                    # exclusively for flams, so map directly.
+                    if getattr(eff, "isGrace", False):
+                        hit["f"] = True
+
+                    # Cymbal choke — GP doesn't have a first-class field for
+                    # it, but staccato on a cymbal piece is the closest
+                    # idiomatic encoding. Treat it as a short choke tail
+                    # (~80 ms) so the highway can render the fade-out.
+                    if (
+                        drums_mod.piece_category(piece) == "cymbal"
+                        and getattr(eff, "staccato", False)
+                    ):
+                        hit["k"] = 0.08
+
+                    hits.append(hit)
+
+                    if piece not in pieces_seen:
+                        # Title-case piece-id for the kit legend name; user-
+                        # facing labels are overridden at the lane-config
+                        # level anyway.
+                        pieces_seen[piece] = piece.replace("_", " ").title()
+
+    hits.sort(key=lambda h: h["t"])
+
+    return {
+        "version": drums_mod.SCHEMA_VERSION,
+        "name": arrangement_name,
+        "kit": [{"id": pid, "name": name} for pid, name in pieces_seen.items()],
+        "hits": hits,
+    }
 
 
 def convert_file(

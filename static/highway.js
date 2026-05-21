@@ -100,6 +100,15 @@ function createHighway() {
     let lyrics = [];
     let toneChanges = [];
     let toneBase = "";
+    // Drum-tab payload (sloppak-spec §5.3). When the active sloppak's
+    // manifest carries a `drum_tab:` key, the server streams a `drum_tab`
+    // metadata message followed by chunked `drum_hits`. `drumTab.hits` is
+    // concatenated across chunks and exposed on the bundle so the drums
+    // plugin can render the new shape language instead of decoding the
+    // legacy guitar-encoded `notes` stream. Stays at the null sentinel
+    // for non-drum-tab songs so plugins can distinguish "no drums" from
+    // "drums loaded but empty".
+    let drumTab = null;  // { version, name, kit: [...], hits: [...] }
     let ready = false;
     // Master-difficulty (slopsmith#48). _phrases stays null as a
     // "slider disabled" sentinel when the source chart has no ladder
@@ -453,6 +462,12 @@ function createHighway() {
             lyrics,
             toneChanges,
             toneBase,
+            // Drum tab payload (or null when the active arrangement has
+            // no drum_tab). Live reference — renderers MUST treat as
+            // read-only. Plugins should prefer this over decoding the
+            // standard `notes` stream when present; absence is the
+            // signal to fall back to legacy MIDI-encoded drums.
+            drumTab,
 
             // Master-difficulty (slopsmith#48)
             mastery: _mastery,
@@ -2230,7 +2245,7 @@ function createHighway() {
             _resizeHandler = () => this.resize();
             window.addEventListener('resize', _resizeHandler);
             ready = false;
-            notes = []; chords = []; handShapes = []; beats = []; sections = []; anchors = []; chordTemplates = []; lyrics = []; toneChanges = []; toneBase = "";
+            notes = []; chords = []; handShapes = []; beats = []; sections = []; anchors = []; chordTemplates = []; lyrics = []; toneChanges = []; toneBase = ""; drumTab = null;
             stringCount = 6;  // default until song_info arrives
             // Reset phrase ladder + filter (slopsmith#48). _mastery
             // persists across arrangement switches — the slider's
@@ -2648,6 +2663,11 @@ function createHighway() {
                                     tuning: msg.tuning,
                                     capo: msg.capo,
                                     format: msg.format,
+                                    // True when the sloppak ships a drum_tab.json.
+                                    // Lets the visualization picker auto-activate
+                                    // the drums plugin even when the active
+                                    // arrangement isn't named "Drums".
+                                    hasDrumTab: Boolean(msg.has_drum_tab),
                                 };
                                 window.slopsmith.emit('song:loaded', window.slopsmith.currentSong);
                             }
@@ -2677,6 +2697,23 @@ function createHighway() {
                         case 'notes': notes = notes.concat(msg.data); break;
                         case 'chords': chords = chords.concat(msg.data); break;
                         case 'handshapes': handShapes = handShapes.concat(msg.data); break;
+                        case 'drum_tab':
+                            // Metadata + kit legend arrive first; the hits
+                            // come in 500-per-frame chunks below. Reset the
+                            // hits array per `drum_tab` to defend against
+                            // an arrangement-change replay on the same WS.
+                            drumTab = {
+                                version: Number.isInteger(msg.version) ? msg.version : 1,
+                                name: (typeof msg.name === 'string' && msg.name) ? msg.name : 'Drums',
+                                kit: Array.isArray(msg.kit) ? msg.kit : [],
+                                hits: [],
+                            };
+                            break;
+                        case 'drum_hits':
+                            if (drumTab && Array.isArray(msg.data)) {
+                                Array.prototype.push.apply(drumTab.hits, msg.data);
+                            }
+                            break;
                         case 'phrases':
                             // Accumulate chunks but DON'T rebuild the filter
                             // until `ready` — rebuilding per chunk would
@@ -2931,7 +2968,7 @@ function createHighway() {
             // Close old WS but keep audio + animation running
             if (ws) { ws.close(); ws = null; }
             ready = false;
-            notes = []; chords = []; handShapes = []; beats = []; sections = []; anchors = []; chordTemplates = []; lyrics = []; toneChanges = []; toneBase = "";
+            notes = []; chords = []; handShapes = []; beats = []; sections = []; anchors = []; chordTemplates = []; lyrics = []; toneChanges = []; toneBase = ""; drumTab = null;
             stringCount = 6;  // default until song_info arrives
             // Drop any per-song offset from the previous load so setTime
             // calls that fire before the next song_info arrives don't
