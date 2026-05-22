@@ -25,12 +25,19 @@
     // all index safely. Default is the canonical Rocksmith classic
     // mapping (low E=red, A=yellow, D=blue, G=orange, B=green,
     // high E=purple); Neon pushes saturation harder; Pastel desaturates
-    // for long-session comfort. In slopsmith's index convention
-    // s=0 is the low E (thickest) and s=5 is the high E (thinnest),
-    // matching Rocksmith's native string indexing. Per-index ordering
-    // is preserved across all three palettes so switching between them
-    // never reassigns a string to a different colour family. Indices
-    // 6/7 are supplementary slots used for 7/8-string arrangements.
+    // for long-session comfort; Colorblind (high contrast) is derived from
+    // Rocksmith 2014's built-in colorblind-mode palette, but this preset
+    // intentionally keeps some entries tuned for slopsmith rather than
+    // reproducing every original game hex value verbatim. The RS2014 base
+    // values came from the RSMods author's reverse-engineering of the game
+    // files; do not treat the tuned values below as the exact in-game
+    // palette.
+    // In slopsmith's index convention s=0 is the low E (thickest) and
+    // s=5 is the high E (thinnest), matching Rocksmith's native string
+    // indexing. Per-index ordering is preserved across all palettes so
+    // switching between them never reassigns a string to a different
+    // colour family. Indices 6/7 are supplementary slots used for
+    // 7/8-string arrangements.
     // NOTE: settings.html mirrors these arrays in its hydration script
     // for the palette-preview swatches — keep them in sync.
     const PALETTES = {
@@ -46,8 +53,16 @@
             0xe89aa0, 0xefdf90, 0x9adfee, 0xefb898,
             0xa6e0a8, 0xc4a6e0, 0xe0a6c8, 0xa6e0d8,
         ],
+        colorblind_hc: [
+            0xa42424, 0xa3f300, 0x19abfc, 0xda7e41,
+            0x30d0a0, 0x7648a7, 0xff6bd5, 0x6bffe6,
+        ],
     };
     const PALETTE_IDS = Object.keys(PALETTES);
+    // Host-facing display names for the panelControls palette descriptor.
+    // Single-word ids fall back to a capitalized id (Default/Neon/Pastel);
+    // multi-word ids that need a real name are overridden here.
+    const PALETTE_LABELS = { colorblind_hc: 'Colorblind (high contrast)' };
     // Default palette at module scope so out-of-IIFE consumers (e.g. the
     // out-of-range warning's reference to "palette size") still have a
     // canonical length to compare against.
@@ -9077,11 +9092,11 @@
             default: BG_DEFAULTS.palette,
             // Derived from PALETTE_IDS so the descriptor stays in sync when a
             // palette is added/removed/renamed — PALETTES is the single
-            // source of truth. Label is the id with its first letter
-            // capitalized (matches the existing Default/Neon/Pastel names).
+            // source of truth. Label uses PALETTE_LABELS where set, else the
+            // capitalized id (matches the Default/Neon/Pastel names).
             options: PALETTE_IDS.map((id) => ({
                 id,
-                label: id.charAt(0).toUpperCase() + id.slice(1),
+                label: PALETTE_LABELS[id] || (id.charAt(0).toUpperCase() + id.slice(1)),
             })),
         },
         {

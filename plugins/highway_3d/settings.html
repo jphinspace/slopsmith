@@ -14,6 +14,7 @@
             <option value="default" selected>Default (Rocksmith classic)</option>
             <option value="neon">Neon (saturated, electric)</option>
             <option value="pastel">Pastel (soft, low contrast)</option>
+            <option value="colorblind_hc">Colorblind (high contrast)</option>
         </select>
         <!-- Live preview of the selected palette. Each swatch is one
              string in the standard six-string mapping (low E → high E,
@@ -593,7 +594,7 @@
         (function () {
             const DEFAULTS = { style: 'particles', intensity: 0.5, reactive: true, palette: 'default', showFretOnNote: true, fretNumberGhostScope: 'rocksmith', cameraSmoothing: 0.5, zoomSmoothing: 0.5, tiltSmoothing: 0.5, cameraLockLow: false, cameraLockZoom: 0.5, cameraMode: 'lookahead', nutHeadstockVisible: true, tuningLabelsVisible: true, nutColor: '#f5f3f0', headstockColor: '#d4b48a', textSize: 0.5, vibrancy: 0.85, glow: 0.25, customImageDataUrl: '', customImageName: '', customVideoName: '', chordDiagramSize: 0.5, chordDiagramPosition: 'tl', fretColumnMarkerCadence: 1, projectionVisible: true, inlayLabelsVisible: false, sectionLabelsOnHighway: false, sectionHudVisible: true, sectionHudPosition: 'tr', sectionHudSize: 0.5 };
             const VALID_STYLES = new Set(['off', 'particles', 'silhouettes', 'lights', 'geometric', 'image', 'video']);
-            const VALID_PALETTES = new Set(['default', 'neon', 'pastel']);
+            const VALID_PALETTES = new Set(['default', 'neon', 'pastel', 'colorblind_hc']);
             const VALID_CAMERA_MODES = new Set(['steady', 'lookahead']);
             const VALID_CHORD_DIAG_POSITIONS = new Set(['tl', 'tr', 'bl', 'br']);
             // Section HUD shares the same four-corner anchor set as the
@@ -924,9 +925,10 @@
             // because that's the standard 6-string layout most charts
             // use; 7/8-string supplementary slots aren't rendered here.
             const PALETTE_HEXES = {
-                default: ['#ff2828', '#ffd400', '#2080ff', '#ff8020', '#30d040', '#a040ff'],
-                neon:    ['#ff0030', '#ffe800', '#0080ff', '#ff8030', '#40ff50', '#b050ff'],
-                pastel:  ['#e89aa0', '#efdf90', '#9adfee', '#efb898', '#a6e0a8', '#c4a6e0'],
+                default:       ['#ff2828', '#ffd400', '#2080ff', '#ff8020', '#30d040', '#a040ff'],
+                neon:          ['#ff0030', '#ffe800', '#0080ff', '#ff8030', '#40ff50', '#b050ff'],
+                pastel:        ['#e89aa0', '#efdf90', '#9adfee', '#efb898', '#a6e0a8', '#c4a6e0'],
+                colorblind_hc: ['#a42424', '#a3f300', '#19abfc', '#da7e41', '#30d0a0', '#7648a7'],
             };
             function renderPaletteSwatches(paletteId) {
                 const hexes = PALETTE_HEXES[paletteId] || PALETTE_HEXES.default;
