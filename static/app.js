@@ -2006,7 +2006,9 @@ function setupAppUpdates() {
 
     function renderStatus(extra) {
         try {
-            void updateApi.getStatus().then((s) => {
+            // Wrap in Promise.resolve so a future getStatus() that returns
+            // synchronously won't blow up on .then().
+            void Promise.resolve(updateApi.getStatus()).then((s) => {
                 if (!s) { statusEl.textContent = extra || 'Updater status unavailable.'; return; }
                 if (s.status === 'unsupported' || s.platform === 'linux') {
                     showLinuxFallback('Auto-update is not available on Linux.');
@@ -6506,6 +6508,10 @@ async function bootstrapPluginsAndUi() {
     // toggling and triggers the initial load.
     setLibView(libView);
     try { await loadSettings(); } catch (e) { console.warn('initial loadSettings failed:', e); }
+    // App Updates UI does not depend on /api/settings — wire it from the
+    // boot path too so a failed loadSettings() (network error etc.) doesn't
+    // leave the block hidden. setupAppUpdates() is idempotent.
+    try { setupAppUpdates(); } catch (e) { console.warn('setupAppUpdates (boot) failed:', e); }
     // App-wide restart banner — must wire once, outside loadSettings(), so a
     // download finishing while the user is on a non-Settings screen still
     // pops the banner.
