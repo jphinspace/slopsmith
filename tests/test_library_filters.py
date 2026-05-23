@@ -322,6 +322,50 @@ def test_query_stats_artist_count_is_case_insensitive(client, server_mod):
     assert stats["letters"].get("T") == 1
 
 
+def test_query_stats_groups_non_ascii_artist_letters_under_hash(client, server_mod):
+    _put(server_mod, filename="angstrom.psarc", title="Angstrom", artist="Ångström")
+
+    stats = client.get("/api/library/stats").json()
+
+    assert stats["letters"] == {"#": 1}
+
+
+def test_query_stats_ignores_null_letter_counts(server_mod):
+    """Legacy/corrupt rows can surface as NULL-ish letter aggregate
+    rows on some SQLite builds. The stats endpoint should ignore those
+    buckets instead of crashing while building the # group."""
+    class Result:
+        def __init__(self, one=None, rows=None):
+            self.one = one
+            self.rows = rows or []
+
+        def fetchone(self):
+            return self.one
+
+        def fetchall(self):
+            return self.rows
+
+    class FakeConn:
+        def execute(self, sql, params=()):
+            if "GROUP BY letter" in sql:
+                return Result(rows=[(None, None), ("#", None), ("T", 1)])
+            if "COUNT(DISTINCT artist COLLATE NOCASE)" in sql:
+                return Result(one=(1,))
+            if "COUNT(*)" in sql:
+                return Result(one=(1,))
+            raise AssertionError(sql)
+
+        def close(self):
+            pass
+
+    server_mod.meta_db.conn.close()
+    server_mod.meta_db.conn = FakeConn()
+
+    stats = server_mod.meta_db.query_stats()
+
+    assert stats == {"total_songs": 1, "total_artists": 1, "letters": {"T": 1}}
+
+
 def test_compound_sort_with_legacy_dir_desc_doesnt_error(client, seeded):
     """Regression for Copilot finding on PR #134: `sort=year&dir=desc`
     used to produce invalid SQL (`CAST(year AS INTEGER) ASC DESC`)

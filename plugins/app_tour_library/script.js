@@ -6,9 +6,58 @@
     var PLUGIN_ID = 'app_tour_library';
     var SCREENS = ['home'];
 
+    var PROVIDER_STEP = {
+        id: 'library-provider',
+        selector: '#lib-provider',
+        title: 'Choose a library',
+        content: 'Use this menu to switch between your local library and any connected remote libraries. Slopsmith remembers the last library you picked.',
+        shape: 'spotlight',
+        position: 'bottom',
+        waitFor: '#lib-provider'
+    };
+
+    async function _loadDefaultSteps() {
+        try {
+            var resp = await fetch('/api/plugins/' + encodeURIComponent(PLUGIN_ID) + '/tour.json');
+            if (!resp.ok) return [];
+            var data = await resp.json();
+            return Array.isArray(data.tour) ? data.tour : [];
+        } catch (e) {
+            console.warn('[app_tour_library] failed to load tour steps', e);
+            return [];
+        }
+    }
+
+    function _isBrowsableProvider(provider) {
+        return !!provider && Array.isArray(provider.capabilities) && provider.capabilities.indexOf('library.read') !== -1;
+    }
+
+    async function _hasMultipleProviders() {
+        try {
+            var resp = await fetch('/api/library/providers');
+            if (!resp.ok) return false;
+            var data = await resp.json();
+            var providers = Array.isArray(data.providers) ? data.providers.filter(_isBrowsableProvider) : [];
+            return providers.length > 1;
+        } catch (e) {
+            console.warn('[app_tour_library] failed to load library providers', e);
+            return false;
+        }
+    }
+
+    async function _buildSteps() {
+        var steps = await _loadDefaultSteps();
+        if (!steps.length || !(await _hasMultipleProviders())) return steps;
+
+        var insertAt = steps.findIndex(function (step) { return step && step.id === 'search'; });
+        var nextSteps = steps.slice();
+        nextSteps.splice(insertAt === -1 ? 1 : insertAt + 1, 0, PROVIDER_STEP);
+        return nextSteps;
+    }
+
     function _register() {
         try {
-            window.slopsmithTour.register(PLUGIN_ID, { screens: SCREENS });
+            window.slopsmithTour.register(PLUGIN_ID, { screens: SCREENS, buildSteps: _buildSteps });
         } catch (e) {
             console.warn('[app_tour_library] register failed', e);
         }

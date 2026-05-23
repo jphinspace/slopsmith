@@ -10,16 +10,17 @@ import sys
 import tempfile
 import shutil
 from pathlib import Path
+from typing import Any, ClassVar
 
 from logging_setup import configure_logging
 configure_logging()
 
 log = logging.getLogger("slopsmith.server")
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 
 from psarc import unpack_psarc, read_psarc_entries
 from song import (
@@ -324,11 +325,13 @@ class MetadataDB:
         return {r[0] for r in self.conn.execute("SELECT filename FROM favorites").fetchall()}
 
     def get(self, filename: str, mtime: float, size: int) -> dict | None:
-        row = self.conn.execute(
-            "SELECT mtime, size, title, artist, album, year, duration, tuning, arrangements, has_lyrics, "
-            "format, stem_count, stem_ids, tuning_name, tuning_sort_key "
-            "FROM songs WHERE filename = ?", (filename,)
-        ).fetchone()
+        cache_key = str(filename)
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT mtime, size, title, artist, album, year, duration, tuning, arrangements, has_lyrics, "
+                "format, stem_count, stem_ids, tuning_name, tuning_sort_key "
+                "FROM songs WHERE filename = ?", (cache_key,)
+            ).fetchone()
         if row and row[0] == mtime and row[1] == size and row[2]:
             return {
                 "title": row[2], "artist": row[3], "album": row[4],
@@ -673,14 +676,369 @@ class MetadataDB:
         ).fetchall()
         letters = {}
         for letter, count in rows:
-            if letter and letter.isalpha():
-                letters[letter] = count
+            count = int(count or 0)
+            if count <= 0:
+                continue
+            key = str(letter or "")
+            if key.isascii() and key.isalpha():
+                letters[key] = letters.get(key, 0) + count
             else:
                 letters["#"] = letters.get("#", 0) + count
         return {"total_songs": total, "total_artists": artist_count, "letters": letters}
 
 
 meta_db = MetadataDB()
+
+
+class LocalLibraryProvider:
+    id = "local"
+    label = "My Library"
+    kind = "local"
+    capabilities = (
+        "library.read",
+        "art.read",
+        "song.play",
+        "favorite.write",
+        "metadata.write",
+        "retune.write",
+    )
+
+    def __init__(self, db: MetadataDB):
+        self._db = db
+
+    def query_page(self, **kwargs) -> tuple[list[dict], int]:
+        return self._db.query_page(**kwargs)
+
+    def query_artists(self, **kwargs) -> tuple[list[dict], int]:
+        return self._db.query_artists(**kwargs)
+
+    def query_stats(self, **kwargs) -> dict:
+        return self._db.query_stats(**kwargs)
+
+    def tuning_names(self) -> dict:
+        with self._db._lock:
+            rows = self._db.conn.execute(
+                "SELECT tuning_name, MIN(tuning_sort_key), COUNT(*) "
+                "FROM songs WHERE title != '' AND COALESCE(tuning_name, '') != '' "
+                "GROUP BY tuning_name COLLATE NOCASE "
+                "ORDER BY ABS(COALESCE(MIN(tuning_sort_key), 0)), "
+                "COALESCE(MIN(tuning_sort_key), 0) ASC, "
+                "tuning_name COLLATE NOCASE"
+            ).fetchall()
+        return {
+            "tunings": [
+                {"name": name, "sort_key": int(sk or 0), "count": count}
+                for name, sk, count in rows
+            ],
+        }
+
+    async def get_art(self, song_id: str):
+        return await get_song_art(song_id)
+
+
+class LibraryProviderRegistry:
+    # Methods required per declared capability — only validated when the
+    # provider advertises the corresponding capability so action-only providers
+    # (e.g. art.read + song.sync without library.read) don't need to implement
+    # unused stubs.
+    _CAPABILITY_METHODS: ClassVar[dict[str, tuple[str, ...]]] = {
+        "library.read": ("query_page", "query_artists", "query_stats", "tuning_names"),
+        "art.read": ("get_art",),
+        "song.sync": ("sync_song",),
+    }
+    _ID_RE: ClassVar[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+
+    def __init__(self):
+        self._providers: dict[str, object] = {}
+        # Capabilities inferred at registration for legacy providers that omit
+        # the `capabilities` field.  Merged with provider_capabilities() so that
+        # runtime capability checks see the complete effective capability set.
+        self._inferred_caps: dict[str, set[str]] = {}
+        self._lock = threading.RLock()
+
+    def register(self, provider: object, *, replace: bool = False) -> object:
+        provider_id = self.provider_id(provider)
+        if not self._ID_RE.match(provider_id):
+            raise ValueError(
+                "library provider id must start with an alphanumeric character "
+                "and contain only letters, digits, _, ., :, or -"
+            )
+        if not self.provider_label(provider):
+            raise ValueError("library provider label must be a non-empty string")
+        # Use declared-only caps during validation — never include stale inferred
+        # caps from a previous provider registered under the same id (replace=True).
+        caps = self._declared_capabilities(provider)
+        # Backward compatibility: providers that predate explicit capability
+        # declarations may omit `capabilities` entirely. If the browse methods
+        # are all present, infer `library.read` so they still work unchanged.
+        # If capabilities are absent but the browse surface is also absent,
+        # raise a clear error rather than letting the provider register and
+        # then fail on every API call with a late 501.
+        inferred: set[str] = set()
+        if not caps:
+            browse_methods = self._CAPABILITY_METHODS["library.read"]
+            if all(callable(self.provider_method(provider, m)) for m in browse_methods):
+                # Legacy provider without explicit capabilities — infer library.read
+                # from the presence of all browse methods.  Store in _inferred_caps
+                # so that runtime capability checks see the full effective set.
+                inferred = {"library.read"}
+                caps = inferred
+            else:
+                raise TypeError(
+                    f"library provider {provider_id!r} must declare at least one capability "
+                    f"(or implement the {browse_methods!r} browse methods for backward compatibility)"
+                )
+        for cap, methods in self._CAPABILITY_METHODS.items():
+            if cap not in caps:
+                continue
+            for method_name in methods:
+                if not callable(self.provider_method(provider, method_name)):
+                    raise TypeError(f"library provider {provider_id!r} declares {cap!r} but is missing callable {method_name}()")
+        with self._lock:
+            if provider_id == "local" and provider_id in self._providers and self._providers[provider_id] is not provider:
+                raise ValueError("the local library provider cannot be replaced")
+            if provider_id in self._providers and not replace:
+                raise ValueError(f"library provider {provider_id!r} is already registered")
+            self._providers[provider_id] = provider
+            if inferred:
+                self._inferred_caps[provider_id] = inferred
+            else:
+                self._inferred_caps.pop(provider_id, None)
+        return provider
+
+    def unregister(self, provider_id: str) -> bool:
+        if provider_id == "local":
+            raise ValueError("the local library provider cannot be unregistered")
+        with self._lock:
+            self._inferred_caps.pop(provider_id, None)
+            return self._providers.pop(provider_id, None) is not None
+
+    def get(self, provider_id: str = "local") -> object | None:
+        with self._lock:
+            return self._providers.get(provider_id or "local")
+
+    def list(self) -> list[dict]:
+        with self._lock:
+            providers = list(self._providers.values())
+        return [self.describe(provider) for provider in providers]
+
+    def describe(self, provider: object) -> dict:
+        provider_id = self.provider_id(provider)
+        return {
+            "id": provider_id,
+            "label": self.provider_label(provider),
+            "kind": self.provider_field(provider, "kind", "local" if provider_id == "local" else "remote"),
+            "capabilities": sorted(self.provider_capabilities(provider)),
+            "default": provider_id == "local",
+        }
+
+    def provider_field(self, provider: object, name: str, default=None):
+        if isinstance(provider, dict):
+            return provider.get(name, default)
+        return getattr(provider, name, default)
+
+    def provider_id(self, provider: object) -> str:
+        provider_id = self.provider_field(provider, "id", "")
+        if not isinstance(provider_id, str) or not provider_id:
+            raise ValueError("library provider id must be a non-empty string")
+        return provider_id
+
+    def provider_label(self, provider: object) -> str:
+        label = self.provider_field(provider, "label", self.provider_field(provider, "name", ""))
+        if not isinstance(label, str):
+            return ""
+        return label.strip()
+
+    def _declared_capabilities(self, provider: object) -> set[str]:
+        """Return only the capabilities explicitly declared on the provider object."""
+        raw = self.provider_field(provider, "capabilities", ())
+        if raw is None:
+            raw = ()
+        if isinstance(raw, str):
+            raw = (raw,) if raw else ()
+        return {str(cap) for cap in raw if cap}
+
+    def provider_capabilities(self, provider: object) -> set[str]:
+        # Guard against a common plugin authoring mistake: passing a single string
+        # instead of a list/tuple. Iterating a string produces individual characters,
+        # none of which would match a valid capability name.
+        declared = self._declared_capabilities(provider)
+        # Merge with any capabilities inferred at registration time for legacy
+        # providers that omit the `capabilities` field but implement browse methods.
+        provider_id = self.provider_id(provider)
+        with self._lock:
+            inferred = self._inferred_caps.get(provider_id, set())
+        return declared | inferred
+
+    def provider_method(self, provider: object, name: str):
+        if isinstance(provider, dict):
+            return provider.get(name)
+        return getattr(provider, name, None)
+
+
+library_providers = LibraryProviderRegistry()
+library_providers.register(LocalLibraryProvider(meta_db))
+
+
+def register_library_provider(provider: object, *, replace: bool = False) -> object:
+    return library_providers.register(provider, replace=replace)
+
+
+def unregister_library_provider(provider_id: str) -> bool:
+    return library_providers.unregister(provider_id)
+
+
+def _get_library_provider(provider: str = "local") -> object:
+    library_provider = library_providers.get(provider or "local")
+    if library_provider is None:
+        raise HTTPException(status_code=404, detail=f"Unknown library provider: {provider}")
+    return library_provider
+
+
+def _require_library_provider_capability(provider: object, capability: str) -> None:
+    if capability in library_providers.provider_capabilities(provider):
+        return
+    provider_id = library_providers.provider_id(provider)
+    raise HTTPException(
+        status_code=501,
+        detail=f"Library provider {provider_id!r} does not declare capability {capability!r}",
+    )
+
+
+def _call_library_provider(provider: object, method_name: str, **kwargs) -> Any:
+    method = library_providers.provider_method(provider, method_name)
+    if not callable(method):
+        provider_id = library_providers.provider_id(provider)
+        raise HTTPException(
+            status_code=501,
+            detail=f"Library provider {provider_id!r} does not support {method_name}",
+        )
+    try:
+        return method(**kwargs)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        provider_id = library_providers.provider_id(provider)
+        # A provider with an explicit kind="local" is treated as local even if
+        # its id is not "local" (e.g. a kind="local" plugin variant). Otherwise
+        # fall back to provider_id comparison so providers that omit `kind` are
+        # still wrapped correctly — the safe default for unknown providers is to
+        # surface an offline message rather than leaking raw exceptions.
+        provider_kind = str(library_providers.provider_field(provider, "kind", "") or "")
+        if provider_kind:
+            is_remote = provider_kind not in ("", "local")
+        else:
+            is_remote = provider_id != "local"
+        if is_remote:
+            detail = f"This source appears to be offline ({provider_id})."
+            message = str(exc).strip()
+            if message:
+                detail = f"{detail} {message}"
+            raise HTTPException(status_code=503, detail=detail) from exc
+        raise
+
+
+def _is_async_callable(obj: object) -> bool:
+    """Return True if obj is an async function or a callable object with an async __call__.
+
+    ``inspect.iscoroutinefunction`` only recognises bare coroutine functions; it returns
+    False for class instances whose ``__call__`` method is defined as ``async def``.
+    Checking both handles the common plugin pattern of wrapping an async method in a
+    callable object.
+    """
+    if inspect.iscoroutinefunction(obj):
+        return True
+    _call = getattr(obj, "__call__", None)
+    return _call is not None and inspect.iscoroutinefunction(_call)
+
+
+async def _call_library_provider_async(provider: object, method_name: str, **kwargs) -> Any:
+    method = library_providers.provider_method(provider, method_name)
+    if _is_async_callable(method):
+        # Async provider method — call directly on the event loop.
+        try:
+            return await method(**kwargs)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            provider_id = library_providers.provider_id(provider)
+            provider_kind = str(library_providers.provider_field(provider, "kind", "") or "")
+            if provider_kind:
+                is_remote = provider_kind not in ("", "local")
+            else:
+                is_remote = provider_id != "local"
+            if is_remote:
+                detail = f"This source appears to be offline ({provider_id})."
+                message = str(exc).strip()
+                if message:
+                    detail = f"{detail} {message}"
+                raise HTTPException(status_code=503, detail=detail) from exc
+            raise
+    # Synchronous provider method — run in a threadpool so the event loop stays free.
+    return await run_in_threadpool(_call_library_provider, provider, method_name, **kwargs)
+
+
+def _safe_art_redirect_url(url: str) -> str | None:
+    """Return the URL if it is safe to redirect to (http/https only), else None."""
+    from urllib.parse import urlparse
+    if not url or not isinstance(url, str):
+        return None
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme.lower() not in ("http", "https"):
+            return None
+        if not parsed.hostname:
+            return None
+        return url
+    except Exception:
+        return None
+
+
+def _library_art_response(result: Any) -> Response:
+    if result is None:
+        raise HTTPException(status_code=404, detail="Library provider returned no art")
+    if isinstance(result, Response):
+        return result
+    if isinstance(result, (bytes, bytearray, memoryview)):
+        return Response(content=bytes(result), media_type="image/png")
+    if isinstance(result, str):
+        safe_url = _safe_art_redirect_url(result)
+        if safe_url is not None:
+            return RedirectResponse(safe_url)
+        # If the string looks like a URL (contains a scheme separator) but
+        # didn't pass the http/https check, refuse it rather than treating
+        # it as a filesystem path — a provider returning ftp:// or file://
+        # should get a 400, not a 500 from FileResponse failing on a URL.
+        if "://" in result:
+            raise HTTPException(
+                status_code=400,
+                detail="Library provider returned an unsupported URL scheme for art",
+            )
+        if not Path(result).is_file():
+            raise HTTPException(status_code=404, detail="Library provider returned an unreadable art path")
+        return FileResponse(result)
+    if isinstance(result, Path):
+        if not result.is_file():
+            raise HTTPException(status_code=404, detail="Library provider returned an unreadable art path")
+        return FileResponse(str(result))
+    if isinstance(result, dict):
+        url = result.get("url") or result.get("art_url") or result.get("artUrl")
+        if isinstance(url, str) and url:
+            safe_url = _safe_art_redirect_url(url)
+            if safe_url is None:
+                raise HTTPException(status_code=400, detail="Library provider returned an unsafe art URL")
+            return RedirectResponse(safe_url)
+        path = result.get("path") or result.get("file")
+        if isinstance(path, (str, Path)):
+            media_type = result.get("media_type") or result.get("content_type")
+            if not Path(path).is_file():
+                raise HTTPException(status_code=404, detail="Library provider returned an unreadable art path")
+            return FileResponse(str(path), media_type=media_type)
+        content = result.get("content") or result.get("bytes")
+        if isinstance(content, (bytes, bytearray, memoryview)):
+            media_type = result.get("media_type") or result.get("content_type") or "image/png"
+            return Response(content=bytes(content), media_type=media_type)
+    raise HTTPException(status_code=500, detail="Library provider returned unsupported art data")
 
 
 def _get_dlc_dir(cfg: dict | None = None) -> Path | None:
@@ -1154,7 +1512,15 @@ def _background_scan():
         except OSError as e:
             log.debug("scan: skipping %s (%s)", f, e)
             continue
-        if not meta_db.get(_rel(f), mtime, size):
+        cache_key = _rel(f)
+        try:
+            cached = meta_db.get(cache_key, mtime, size)
+        except Exception as e:
+            # Keep scanning even if a single metadata lookup fails.
+            # The file will be re-scanned and cache repaired by put().
+            log.warning("scan cache lookup failed for %s: %s", cache_key, e)
+            cached = None
+        if not cached:
             to_scan.append((f, mtime, size))
 
     if not to_scan:
@@ -1342,6 +1708,11 @@ async def startup_events():
         "get_dlc_dir": _get_dlc_dir,
         "extract_meta": _extract_meta_for_file,
         "meta_db": meta_db,
+        "get_scan_status": lambda: dict(_scan_status),
+        "get_art_cache_dir": lambda: ART_CACHE_DIR,
+        "library_providers": library_providers,
+        "register_library_provider": register_library_provider,
+        "unregister_library_provider": unregister_library_provider,
         "get_sloppak_cache_dir": lambda: SLOPPAK_CACHE_DIR,
         "register_demo_janitor_hook": register_demo_janitor_hook,
     }
@@ -2209,98 +2580,135 @@ def _parse_has_lyrics(raw: str) -> int | None:
     return None
 
 
-@app.get("/api/library")
-def list_library(q: str = "", page: int = 0, size: int = 24, sort: str = "artist",
-                 dir: str = "asc", favorites: int = 0, format: str = "",
-                 arrangements_has: str = "", arrangements_lacks: str = "",
-                 stems_has: str = "", stems_lacks: str = "",
-                 has_lyrics: str = "", tunings: str = ""):
-    """Paginated library search, queried from SQLite."""
-    size = min(size, 100)
+def _library_filter_args(q: str = "", favorites: int = 0, format: str = "",
+                         arrangements_has: str = "", arrangements_lacks: str = "",
+                         stems_has: str = "", stems_lacks: str = "",
+                         has_lyrics: str = "", tunings: str = "") -> dict:
     fmt = format if format in ("psarc", "sloppak", "loose") else ""
-    songs, total = meta_db.query_page(
-        q=q, page=page, size=size, sort=sort,
-        direction=dir, favorites_only=bool(favorites), format_filter=fmt,
-        arrangements_has=_split_csv(arrangements_has),
-        arrangements_lacks=_split_csv(arrangements_lacks),
-        stems_has=_split_csv(stems_has),
-        stems_lacks=_split_csv(stems_lacks),
-        has_lyrics=_parse_has_lyrics(has_lyrics),
-        tunings=_split_csv(tunings),
+    return {
+        "q": q,
+        "favorites_only": bool(favorites),
+        "format_filter": fmt,
+        "arrangements_has": _split_csv(arrangements_has),
+        "arrangements_lacks": _split_csv(arrangements_lacks),
+        "stems_has": _split_csv(stems_has),
+        "stems_lacks": _split_csv(stems_lacks),
+        "has_lyrics": _parse_has_lyrics(has_lyrics),
+        "tunings": _split_csv(tunings),
+    }
+
+
+@app.get("/api/library/providers")
+def list_library_providers():
+    """List registered library providers."""
+    return {"providers": library_providers.list()}
+
+
+@app.get("/api/library/providers/{provider_id}/songs/{song_id:path}/art")
+async def get_library_provider_song_art(provider_id: str, song_id: str):
+    """Return album art for a song owned by a library provider."""
+    library_provider = _get_library_provider(provider_id)
+    _require_library_provider_capability(library_provider, "art.read")
+    result = await _call_library_provider_async(library_provider, "get_art", song_id=song_id)
+    return _library_art_response(result)
+
+
+@app.post("/api/library/providers/{provider_id}/songs/{song_id:path}/sync")
+async def sync_library_provider_song(provider_id: str, song_id: str):
+    """Ask a provider to sync a remote song into the local library/cache."""
+    library_provider = _get_library_provider(provider_id)
+    _require_library_provider_capability(library_provider, "song.sync")
+    result = await _call_library_provider_async(library_provider, "sync_song", song_id=song_id)
+    if result is None:
+        return {"ok": True}
+    if isinstance(result, dict):
+        return result
+    return {"ok": True, "result": result}
+
+
+@app.get("/api/library")
+async def list_library(q: str = "", page: int = 0, size: int = 24, sort: str = "artist",
+                       dir: str = "asc", favorites: int = 0, format: str = "",
+                       arrangements_has: str = "", arrangements_lacks: str = "",
+                       stems_has: str = "", stems_lacks: str = "",
+                       has_lyrics: str = "", tunings: str = "", provider: str = "local"):
+    """Paginated library search through the selected library provider."""
+    size = min(size, 100)
+    library_provider = _get_library_provider(provider)
+    _require_library_provider_capability(library_provider, "library.read")
+    songs, total = await _call_library_provider_async(
+        library_provider,
+        "query_page",
+        page=page,
+        size=size,
+        sort=sort,
+        direction=dir,
+        **_library_filter_args(
+            q=q, favorites=favorites, format=format,
+            arrangements_has=arrangements_has, arrangements_lacks=arrangements_lacks,
+            stems_has=stems_has, stems_lacks=stems_lacks,
+            has_lyrics=has_lyrics, tunings=tunings,
+        ),
     )
     return {"songs": songs, "total": total, "page": page, "size": size}
 
 
 @app.get("/api/library/artists")
-def list_artists(letter: str = "", q: str = "", favorites: int = 0, page: int = 0, size: int = 50,
-                 format: str = "",
-                 arrangements_has: str = "", arrangements_lacks: str = "",
-                 stems_has: str = "", stems_lacks: str = "",
-                 has_lyrics: str = "", tunings: str = ""):
+async def list_artists(letter: str = "", q: str = "", favorites: int = 0, page: int = 0,
+                       size: int = 50, format: str = "",
+                       arrangements_has: str = "", arrangements_lacks: str = "",
+                       stems_has: str = "", stems_lacks: str = "",
+                       has_lyrics: str = "", tunings: str = "", provider: str = "local"):
     """Get artists grouped by letter with albums and songs (for tree view)."""
-    fmt = format if format in ("psarc", "sloppak", "loose") else ""
-    artists, total = meta_db.query_artists(
-        letter=letter, q=q, favorites_only=bool(favorites),
-        page=page, size=min(size, 100), format_filter=fmt,
-        arrangements_has=_split_csv(arrangements_has),
-        arrangements_lacks=_split_csv(arrangements_lacks),
-        stems_has=_split_csv(stems_has),
-        stems_lacks=_split_csv(stems_lacks),
-        has_lyrics=_parse_has_lyrics(has_lyrics),
-        tunings=_split_csv(tunings),
+    size = min(size, 100)
+    library_provider = _get_library_provider(provider)
+    _require_library_provider_capability(library_provider, "library.read")
+    artists, total = await _call_library_provider_async(
+        library_provider,
+        "query_artists",
+        letter=letter,
+        page=page,
+        size=size,
+        **_library_filter_args(
+            q=q, favorites=favorites, format=format,
+            arrangements_has=arrangements_has, arrangements_lacks=arrangements_lacks,
+            stems_has=stems_has, stems_lacks=stems_lacks,
+            has_lyrics=has_lyrics, tunings=tunings,
+        ),
     )
     return {"artists": artists, "total_artists": total, "page": page, "size": size}
 
 
 @app.get("/api/library/stats")
-def library_stats(favorites: int = 0, q: str = "", format: str = "",
-                  arrangements_has: str = "", arrangements_lacks: str = "",
-                  stems_has: str = "", stems_lacks: str = "",
-                  has_lyrics: str = "", tunings: str = ""):
+async def library_stats(favorites: int = 0, q: str = "", format: str = "",
+                        arrangements_has: str = "", arrangements_lacks: str = "",
+                        stems_has: str = "", stems_lacks: str = "",
+                        has_lyrics: str = "", tunings: str = "", provider: str = "local"):
     """Aggregate stats for the UI. Accepts the same filter params as
     /api/library so the letter bar mirrors the active grid filter set."""
-    fmt = format if format in ("psarc", "sloppak", "loose") else ""
-    return meta_db.query_stats(
-        favorites_only=bool(favorites), q=q, format_filter=fmt,
-        arrangements_has=_split_csv(arrangements_has),
-        arrangements_lacks=_split_csv(arrangements_lacks),
-        stems_has=_split_csv(stems_has),
-        stems_lacks=_split_csv(stems_lacks),
-        has_lyrics=_parse_has_lyrics(has_lyrics),
-        tunings=_split_csv(tunings),
+    library_provider = _get_library_provider(provider)
+    _require_library_provider_capability(library_provider, "library.read")
+    return await _call_library_provider_async(
+        library_provider,
+        "query_stats",
+        **_library_filter_args(
+            q=q, favorites=favorites, format=format,
+            arrangements_has=arrangements_has, arrangements_lacks=arrangements_lacks,
+            stems_has=stems_has, stems_lacks=stems_lacks,
+            has_lyrics=has_lyrics, tunings=tunings,
+        ),
     )
 
 
 @app.get("/api/library/tuning-names")
-def list_tuning_names():
+async def list_tuning_names(provider: str = "local"):
     """Distinct tuning names present in the library, with per-tuning
     counts. Powers the tuning multi-select. Sorted by `tuning_sort_key`
     so names appear in the same musical order the sort uses
     (slopsmith#22) — E Standard first, then nearest neighbors."""
-    rows = meta_db.conn.execute(
-        "SELECT tuning_name, MIN(tuning_sort_key), COUNT(*) "
-        # NULL/empty-name rows are excluded entirely from the picker —
-        # users can't usefully filter by an unknown tuning. Once they
-        # rescan, the rows acquire a name and join the list.
-        "FROM songs WHERE title != '' AND COALESCE(tuning_name, '') != '' "
-        "GROUP BY tuning_name COLLATE NOCASE "
-        # Same ordering as `sort=tuning` in `query_page`: distance
-        # from E Standard first, then signed-key ASC so the down-
-        # tuned variant precedes the up-tuned one at equal distance
-        # (Eb Standard before F Standard at distance 6). Final
-        # alphabetical tiebreak keeps the order deterministic.
-        # COALESCE around the sort_key guards against NULL the same
-        # way the main tuning sort does.
-        "ORDER BY ABS(COALESCE(MIN(tuning_sort_key), 0)), "
-        "COALESCE(MIN(tuning_sort_key), 0) ASC, "
-        "tuning_name COLLATE NOCASE"
-    ).fetchall()
-    return {
-        "tunings": [
-            {"name": name, "sort_key": int(sk or 0), "count": count}
-            for name, sk, count in rows
-        ],
-    }
+    library_provider = _get_library_provider(provider)
+    _require_library_provider_capability(library_provider, "library.read")
+    return await _call_library_provider_async(library_provider, "tuning_names")
 
 
 @app.post("/api/favorites/toggle")
@@ -3085,7 +3493,6 @@ def import_settings(bundle: dict):
 # The bundle format is specified in docs/diagnostics-bundle-spec.md.
 
 from fastapi import Body
-from fastapi.responses import Response
 
 from diagnostics_bundle import build_bundle as _diag_build, preview_bundle as _diag_preview
 from diagnostics_hardware import collect as _diag_hardware
