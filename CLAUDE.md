@@ -85,7 +85,7 @@ Best practices:
 - `extract_meta()` — metadata extraction callable
 - `meta_db` — shared MetadataDB instance
 - `library_providers` — shared library provider registry for source-aware browsing
-- `register_library_provider(provider)` — register a plugin-provided library source. Providers expose `id`, `label`, optional `kind`/`capabilities`, and callable `query_page`, `query_artists`, `query_stats`, and `tuning_names` methods. Providers with `art.read` may also expose `get_art(song_id)`, and providers with `song.sync` may expose `sync_song(song_id)` returning synced local file metadata.
+- `register_library_provider(provider)` — register a plugin-provided library source. Providers expose `id`, `label`, optional `kind`/`capabilities`, and callable `query_page`, `query_artists`, `query_stats`, and `tuning_names` methods. Providers with `art.read` may also expose `get_art(song_id)` returning one of: a `Response` object, raw `bytes`, a URL string (http/https → redirect), a filesystem path string or `Path` (served as a file), or a `dict` with a `url`, `path`, or `content` key. Providers with `song.sync` may expose `sync_song(song_id)` returning `None` (success with no local file) or a `dict` — the dict is passed through as the JSON response and should include `filename`/`local_filename` if a local playable file was produced.
 - `unregister_library_provider(provider_id)` — remove a plugin-provided library source by id. The built-in `local` provider cannot be removed.
 - `get_sloppak_cache_dir()` — sloppak cache path
 - `load_sibling(name)` — loads a sibling module from this plugin's directory under a unique, namespaced module name. See "Sibling imports" below.
