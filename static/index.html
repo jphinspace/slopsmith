@@ -235,6 +235,38 @@
             <h2 class="text-3xl font-bold text-white mb-8">Settings</h2>
 
             <div class="space-y-10">
+                <!-- App Updates — Velopack auto-update, desktop only. Stays
+                     hidden in the plain web app; setupAppUpdates() unhides
+                     this block when window.slopsmithDesktop.update exists,
+                     and shows a disabled "not available on Linux" fallback
+                     when running on Linux. -->
+                <div id="app-updates-block" class="hidden border border-gray-800 rounded-xl bg-dark-800/40 p-5">
+                    <h3 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-4">App Updates</h3>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div>
+                            <label class="text-sm font-medium text-gray-400 mb-2 block" for="app-update-channel">Update channel</label>
+                            <select id="app-update-channel"
+                                class="w-full bg-dark-700 border border-gray-800 rounded-xl px-3 py-2.5 text-sm text-gray-300 outline-none">
+                                <option value="stable">Stable</option>
+                                <option value="rc">Release candidate</option>
+                                <option value="beta">Beta</option>
+                                <option value="alpha">Alpha</option>
+                            </select>
+                        </div>
+                        <div class="flex items-end">
+                            <button id="app-update-check-now"
+                                class="bg-accent hover:bg-accent-light px-4 py-2.5 rounded-xl text-sm font-medium text-white transition disabled:opacity-50">
+                                Check for updates
+                            </button>
+                        </div>
+                    </div>
+                    <p id="app-update-status" class="text-xs text-gray-500 mt-3">Loading updater status…</p>
+                    <p id="app-update-linux-note" class="hidden text-xs text-amber-300 mt-2">
+                        Auto-update is not available on Linux —
+                        <a href="https://github.com/byrongamatos/slopsmith-desktop/releases" target="_blank" rel="noopener" class="text-accent hover:text-accent-light underline">download new versions from GitHub Releases</a>.
+                    </p>
+                </div>
+
                 <!-- ── Core Slopsmith settings ─────────────────────────────── -->
                 <section>
                     <h3 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-4">Slopsmith</h3>
