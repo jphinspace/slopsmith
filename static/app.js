@@ -1961,7 +1961,15 @@ function setupAppUpdates() {
     const block = document.getElementById('app-updates-block');
     if (!block) return;
     const updateApi = window.slopsmithDesktop?.update;
-    if (!updateApi) return; // web app — leave the block hidden
+    // Per-method capability check: an older or partial slopsmith-desktop
+    // bridge may expose `update` without the full shape. Skip wiring (and
+    // leave the block hidden) rather than throwing on first interaction.
+    if (!updateApi
+        || typeof updateApi.getStatus !== 'function'
+        || typeof updateApi.setChannel !== 'function'
+        || typeof updateApi.checkNow !== 'function') {
+        return;
+    }
 
     block.classList.remove('hidden');
 
@@ -2108,7 +2116,16 @@ function setupAppUpdates() {
 
 function initAppUpdateBanner() {
     const updateApi = window.slopsmithDesktop?.update;
-    if (!updateApi || typeof updateApi.onDownloaded !== 'function') return;
+    // Same capability gate as setupAppUpdates — the banner needs onDownloaded
+    // to subscribe, getStatus to detect pre-existing pending updates on boot,
+    // and apply to actually restart from the button. A bridge missing any
+    // of these would partially fail; better to no-op cleanly.
+    if (!updateApi
+        || typeof updateApi.onDownloaded !== 'function'
+        || typeof updateApi.getStatus !== 'function'
+        || typeof updateApi.apply !== 'function') {
+        return;
+    }
 
     const BANNER_ID = 'slopsmith-update-banner';
 
@@ -2199,8 +2216,12 @@ function initAppUpdateBanner() {
     // complete in the current session, so do an explicit status check too.
     try {
         void Promise.resolve(updateApi.getStatus()).then((status) => {
-            if (status && status.status === 'downloaded' && status.pending && status.pending.version) {
-                renderUpdateBanner({ version: status.pending.version, channel: status.channel });
+            // Render the banner for any 'downloaded' status; the version
+            // string is best-effort — renderUpdateBanner() already drops the
+            // "(vX.Y.Z)" suffix when none is supplied, so an update reported
+            // without pending.version still surfaces the restart prompt.
+            if (status && status.status === 'downloaded') {
+                renderUpdateBanner({ version: status.pending?.version, channel: status.channel });
             }
         }).catch((e) => {
             console.warn('[updater] getStatus on init failed:', e);
