@@ -1172,7 +1172,7 @@ def convert_piano_track(
     rs_chords = []
     chord_templates: list[ChordTemplate] = []
     chord_template_map: dict[tuple, int] = {}
-    last_note_per_string: dict[tuple[int, int], RsNote] = {}  # for tie sustain extension
+    last_note_per_pitch: dict[tuple[int, int], RsNote] = {}  # (rs_string, rs_fret) → note, for tie sustain extension
 
     for entry in schedule:
         measure = track.measures[entry.mh_index]
@@ -1207,7 +1207,7 @@ def convert_piano_track(
                     rs_fret = midi_note % 24
 
                     if note.type == guitarpro.NoteType.tie:
-                        prev = last_note_per_string.get((rs_string, rs_fret))
+                        prev = last_note_per_pitch.get((rs_string, rs_fret))
                         if prev is not None:
                             prev.sustain = max(prev.sustain, (t + dur) - prev.time)
                         continue
@@ -1226,7 +1226,7 @@ def convert_piano_track(
                         rn.accent = True
 
                     beat_notes.append(rn)
-                    last_note_per_string[(rs_string, rs_fret)] = rn
+                    last_note_per_pitch[(rs_string, rs_fret)] = rn
 
                 if not beat_notes:
                     continue
