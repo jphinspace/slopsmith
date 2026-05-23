@@ -759,11 +759,11 @@ def test_piano_tied_chord_both_notes_extended():
         )
 
 
-# ── convert_track: tie must not cross a repeat-loopback boundary ─────────────
-# When the playback schedule jumps backwards (measure B → measure A again in a
-# repeat), the tie-tracking state must be cleared so a tie note at the start of
-# measure A on the second pass cannot accidentally extend the last note emitted
-# from measure B (end of the first pass).
+# ── convert_track: tie must not cross a non-consecutive schedule boundary ─────
+# When the playback schedule jumps to a non-consecutive authored measure (repeat
+# loopbacks go backwards; volta skips and al-Coda redirects jump forward over
+# measures), the tie-tracking state must be cleared so a tie note at the jump
+# target cannot accidentally extend an unrelated note from the previous entry.
 
 
 def _ct_song_repeat(beats_m0, beats_m1):

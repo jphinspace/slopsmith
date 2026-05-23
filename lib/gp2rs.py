@@ -627,10 +627,14 @@ def convert_track(
     _prev_mh_index: int = -1  # sentinel: no previous entry
 
     for entry in schedule:
-        # A repeat loopback or D.S./D.C. jump means the authored timeline
-        # goes backwards. Ties cannot span that discontinuity, so clear the
-        # tracking dict at every non-monotone schedule boundary.
-        if entry.mh_index <= _prev_mh_index:
+        # Clear the tie-tracking state whenever the schedule does not advance
+        # to the very next consecutive authored measure.  This covers:
+        #   • repeat loopbacks / D.S./D.C. (mh_index goes backwards), and
+        #   • forward skips (volta alternatives, al-Coda redirects) that jump
+        #     over one or more measures.
+        # A tie can only bridge two *immediately adjacent* authored measures;
+        # any other schedule transition is a discontinuity.
+        if _prev_mh_index != -1 and entry.mh_index != _prev_mh_index + 1:
             last_note_per_string.clear()
         _prev_mh_index = entry.mh_index
         measure = track.measures[entry.mh_index]
@@ -1183,10 +1187,14 @@ def convert_piano_track(
     _prev_mh_index: int = -1  # sentinel: no previous entry
 
     for entry in schedule:
-        # A repeat loopback or D.S./D.C. jump means the authored timeline
-        # goes backwards. Ties cannot span that discontinuity, so clear the
-        # tracking dict at every non-monotone schedule boundary.
-        if entry.mh_index <= _prev_mh_index:
+        # Clear the tie-tracking state whenever the schedule does not advance
+        # to the very next consecutive authored measure.  This covers:
+        #   • repeat loopbacks / D.S./D.C. (mh_index goes backwards), and
+        #   • forward skips (volta alternatives, al-Coda redirects) that jump
+        #     over one or more measures.
+        # A tie can only bridge two *immediately adjacent* authored measures;
+        # any other schedule transition is a discontinuity.
+        if _prev_mh_index != -1 and entry.mh_index != _prev_mh_index + 1:
             last_note_per_pitch.clear()
         _prev_mh_index = entry.mh_index
         measure = track.measures[entry.mh_index]
