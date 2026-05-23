@@ -662,7 +662,7 @@ def test_tied_note_extends_sustain_not_duplicate():
     beat2 = _ct_beat(tick=GP_TICKS_PER_QUARTER, dur_value=4, notes=[note2])
 
     xml_str = convert_track(_ct_song([beat1, beat2]), track_index=0)
-    root = ET.fromstring(xml_str)
+    root = ET.fromstring(xml_str)  # noqa: S314
     notes = root.findall(".//notes/note")
 
     assert len(notes) == 1, f"tie must not emit a second note; got {len(notes)}"
@@ -677,7 +677,7 @@ def test_tied_note_without_predecessor_is_silently_dropped():
     beat = _ct_beat(tick=0, dur_value=4, notes=[note])
 
     xml_str = convert_track(_ct_song([beat]), track_index=0)
-    root = ET.fromstring(xml_str)
+    root = ET.fromstring(xml_str)  # noqa: S314
     notes = root.findall(".//notes/note")
     assert len(notes) == 0
 
@@ -729,7 +729,7 @@ def test_tie_does_not_attach_to_overwritten_earlier_voice_note():
 
     xml_str = convert_track(_ct_multivoice_song([[v0_beat2], [v1_beat0, v1_tie]]),
                             track_index=0)
-    root = ET.fromstring(xml_str)
+    root = ET.fromstring(xml_str)  # noqa: S314
     notes = root.findall(".//notes/note")
 
     sustains = {n.get("fret"): float(n.get("sustain")) for n in notes}
@@ -748,7 +748,7 @@ def test_two_normal_notes_on_same_string_are_both_emitted():
     beat2 = _ct_beat(tick=GP_TICKS_PER_QUARTER, dur_value=4, notes=[note2])
 
     xml_str = convert_track(_ct_song([beat1, beat2]), track_index=0)
-    root = ET.fromstring(xml_str)
+    root = ET.fromstring(xml_str)  # noqa: S314
     notes = root.findall(".//notes/note")
 
     assert len(notes) == 2
@@ -803,7 +803,7 @@ def test_piano_tied_chord_both_notes_extended():
     beat2 = _ct_beat(tick=GP_TICKS_PER_QUARTER, dur_value=4, notes=[t_c3, t_d3])
 
     xml_str = convert_piano_track(_piano_song([beat1, beat2]), track_index=0)
-    root = ET.fromstring(xml_str)
+    root = ET.fromstring(xml_str)  # noqa: S314
     chords = root.findall(".//chords/chord")
 
     assert len(chords) == 1, "tie beat must not emit a second chord"
@@ -905,7 +905,7 @@ def test_tie_not_extended_across_repeat_boundary():
                            notes=[_ct_note(guitarpro.NoteType.normal, gp_string=1, fret=5)])
 
     xml_str = convert_track(_ct_song_repeat([tie_beat], [normal_beat]), track_index=0)
-    root = ET.fromstring(xml_str)
+    root = ET.fromstring(xml_str)  # noqa: S314
     notes = root.findall(".//notes/note")
 
     # Two passes through measure 1 → two normal notes; the ties are both dropped.
