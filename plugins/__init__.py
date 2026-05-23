@@ -619,7 +619,7 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
             if not manifest_path.exists():
                 continue
             try:
-                manifest = json.loads(manifest_path.read_text())
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             except Exception as e:
                 log.warning("Failed to read plugin manifest %s: %s", manifest_path, e)
                 continue
