@@ -5046,12 +5046,19 @@
             }
         }
 
-        /* ── Lookahead fret bounds + smooth camera ───────────────────────── */
-        function lookaheadComputeFretBounds(now, anchors, notes, chords) {
-            const tEnd = now + CAM_LOOKAHEAD_SEC;
-            let minF = 99;
-            let maxF = 0;
-            let any = false;
+        /* ── Camera fret bounds + smooth camera ──────────────────────────── */
+        function cameraBoundsCenterWorldX(minF, maxF) {
+            return (xFretMid(minF) + xFretMid(maxF)) * 0.5;
+        }
+
+        function computeCameraFretBounds(now, anchors, notes, chords, aheadSec) {
+            const tEnd = now + aheadSec;
+            let noteMinF = 99;
+            let noteMaxF = 0;
+            let noteAny = false;
+            let anchorMinF = 99;
+            let anchorMaxF = 0;
+            let anchorAny = false;
             if (anchors && anchors.length) {
                 for (let tt = now; tt <= tEnd + 1e-9; tt += 0.125) {
                     const a = getChartAnchorAt(anchors, tt);
@@ -5062,45 +5069,48 @@
                     if (!Number.isFinite(w)) w = 4;
                     w = Math.max(1, Math.round(w));
                     const fHi = Math.min(NFRETS, fStart + w - 1);
-                    minF = Math.min(minF, fStart);
-                    maxF = Math.max(maxF, fHi);
-                    any = true;
+                    anchorMinF = Math.min(anchorMinF, fStart);
+                    anchorMaxF = Math.max(anchorMaxF, fHi);
+                    anchorAny = true;
                 }
             }
             const consider = f => {
                 if (!(f > 0)) return;
-                minF = Math.min(minF, f);
-                maxF = Math.max(maxF, f);
-                any = true;
+                noteMinF = Math.min(noteMinF, f);
+                noteMaxF = Math.max(noteMaxF, f);
+                noteAny = true;
             };
             if (notes) {
-                let i = lowerBoundT(notes, now);
-                for (; i < notes.length; i++) {
+                for (let i = 0; i < notes.length; i++) {
                     const n = notes[i];
                     if (n.t > tEnd) break;
+                    if (n.t < now && n.t + (n.sus || 0) < now) continue;
                     if (!validString(n.s)) continue;
                     consider(n.f);
                 }
             }
             if (chords) {
-                let i = lowerBoundT(chords, now);
-                for (; i < chords.length; i++) {
+                for (let i = 0; i < chords.length; i++) {
                     const ch = chords[i];
                     if (ch.t > tEnd) break;
                     if (!ch.notes) continue;
+                    let maxSus = 0;
+                    for (const cn of ch.notes) if ((cn.sus || 0) > maxSus) maxSus = cn.sus;
+                    if (ch.t < now && ch.t + maxSus < now) continue;
                     for (const cn of ch.notes) {
                         if (!validString(cn.s)) continue;
                         consider(cn.f);
                     }
                 }
             }
-            if (!any || minF > maxF) return null;
-            return { minF, maxF };
+            if (noteAny && noteMinF <= noteMaxF) return { minF: noteMinF, maxF: noteMaxF };
+            if (anchorAny && anchorMinF <= anchorMaxF) return { minF: anchorMinF, maxF: anchorMaxF };
+            return null;
         }
 
         function lookaheadTargetWorldX(minF, maxF) {
             const wb = CAM_FRET_EDGE_BLEND;
-            const middle = (xFretMid(minF) + xFretMid(maxF)) * 0.5;
+            const middle = cameraBoundsCenterWorldX(minF, maxF);
             const weighted = 0.6 * xFret(0) + 0.4 * xFret(NFRETS);
             return middle * (1 - wb) + weighted * wb;
         }
@@ -6011,8 +6021,10 @@
             const beats = bundle.beats;
             const sections = bundle.sections;
             const anchors = bundle.anchors;
+            const sharedCameraBoundsNow =
+                computeCameraFretBounds(now, anchors, notes, chords, CAM_LOOKAHEAD_SEC);
             const lookaheadBoundsNow = (cameraMode === 'lookahead')
-                ? lookaheadComputeFretBounds(now, anchors, notes, chords)
+                ? sharedCameraBoundsNow
                 : null;
 
             // Open-string note width: same outer span as chord frame (anchor + padX,
@@ -6210,9 +6222,9 @@
                 if (now - fretLastActiveTime[f] < FRET_COOLDOWN) activeFrets.add(f);
             }
 
-            // Camera targeting — steady mode (#34): recency-weighted centroid +
-            // hysteresis over [camT0, camT1]. In lookahead mode, see
-            // lookaheadBoundsNow + lookaheadSmoothCamStep().
+            // Camera targeting — both modes use shared actual-note-first fret
+            // bounds for zoom/span. Steady uses that range's centre with X
+            // hysteresis; lookahead additionally eases the focal range forward.
             let cs = 0;
             let camAhead = CAM_TGT_AHEAD_C;
             let camTau = CAM_TGT_TAU_C;
@@ -6230,9 +6242,11 @@
                 camT0 = now - CAM_TGT_BEHIND;
                 camT1 = now + camAhead;
             }
+            const steadyBoundsNow = (cameraMode === 'lookahead') ? null : sharedCameraBoundsNow;
 
-            // Classic path (#34): tgtDist hysteresis tracks fret span over the
-            // narrowed [camT0, camT1]; lookahead mode uses lookaheadBoundsNow + span smoothing.
+            // Steady path keeps the old recency accumulators as a fallback, but
+            // normally overrides them with sharedCameraBoundsNow below so both
+            // camera modes agree on the fret range that needs framing.
             //
             // Sustain extension: the outer loop keeps notes/chords
             // whose sustain still rings into the visible window —
@@ -6332,58 +6346,19 @@
                             _camSnapped = true;
                             _lookaheadCamPrevNow = now;
                         }
-                    } else {
-                    let preWX = 0, preWSum = 0, preDistMin = 99, preDistMax = 0, preDistGot = false;
-                    if (notes) {
-                        for (const n of notes) {
-                            // bundle.notes is time-sorted: skip fully-expired sustains,
-                            // break once the onset is beyond the camera window.
-                            if (n.t + (n.sus || 0) < camT0) continue;
-                            if (n.t > camT1) break;
-                            if (!validString(n.s)) continue;
-                            const nInWin  = n.f > 0 && n.t >= camT0;
-                            const nSusNow = n.f > 0 && n.t < camT0 && n.t + (n.sus || 0) >= now;
-                            if (nInWin || nSusNow) {
-                                const w = Math.exp(-Math.abs(n.t - now) / camTau);
-                                preWX += xFretMid(n.f) * w; preWSum += w;
-                                if (n.f < preDistMin) preDistMin = n.f;
-                                if (n.f > preDistMax) preDistMax = n.f;
-                                preDistGot = true;
-                            }
-                        }
-                    }
-                    if (chords) {
-                        for (const ch of chords) {
-                            if (!ch.notes) continue;
-                            // bundle.chords is time-sorted: break once onset is beyond window.
-                            if (ch.t > camT1) break;
-                            const chNotes = filterValidNotes(ch.notes);
-                            if (!chNotes.length) continue;
-                            let maxSus = 0;
-                            for (const n of chNotes) if ((n.sus || 0) > maxSus) maxSus = n.sus;
-                            if (ch.t + maxSus < camT0) continue; // fully expired
-                            const chOnsetInWin = ch.t >= camT0;
-                            const chSusNow     = ch.t < camT0 && ch.t + maxSus >= now;
-                            if (!chOnsetInWin && !chSusNow) continue;
-                            const chW = Math.exp(-Math.abs(ch.t - now) / camTau);
-                            for (const cn of chNotes) {
-                                const cnOk = chOnsetInWin || (chSusNow && ch.t + (cn.sus || 0) >= now);
-                                if (cn.f > 0 && cnOk) {
-                                    preWX += xFretMid(cn.f) * chW; preWSum += chW;
-                                    if (cn.f < preDistMin) preDistMin = cn.f;
-                                    if (cn.f > preDistMax) preDistMax = cn.f;
-                                    preDistGot = true;
-                                }
-                            }
-                        }
-                    }
-                    if (preWSum > 0) {
-                        _applyNoteCamTargets(preWX, preWSum, preDistMin, preDistMax, preDistGot,
-                                             camHystF, camDistHystF, /* skipDistHyst= */ true);
+                    } else if (steadyBoundsNow) {
+                        _applyNoteCamTargets(
+                            cameraBoundsCenterWorldX(steadyBoundsNow.minF, steadyBoundsNow.maxF),
+                            1,
+                            steadyBoundsNow.minF,
+                            steadyBoundsNow.maxF,
+                            true,
+                            camHystF,
+                            camDistHystF,
+                            /* skipDistHyst= */ true);
                         curX    = tgtX;
                         curDist = tgtDist;
                         _camSnapped = true;
-                    }
                     } // end steady-mode pre-pass branch
                 } // end !_camSnapped (post-prescan guard)
             }
@@ -7655,6 +7630,13 @@
             // ── Camera target ─────────────────────────────────────────────
             let lockActive;
             if (!(cameraMode === 'lookahead')) {
+                if (steadyBoundsNow) {
+                    camWX = cameraBoundsCenterWorldX(steadyBoundsNow.minF, steadyBoundsNow.maxF);
+                    camWSum = 1;
+                    camDistMin = steadyBoundsNow.minF;
+                    camDistMax = steadyBoundsNow.maxF;
+                    camDistGot = true;
+                }
                 lockActive = _applyNoteCamTargets(
                     camWX, camWSum, camDistMin, camDistMax, camDistGot,
                     camHystF, camDistHystF, /* skipDistHyst= */ false);
