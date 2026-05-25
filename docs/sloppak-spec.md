@@ -78,7 +78,7 @@ Full set of currently-recognized top-level keys:
 | `duration` | float | yes | Song length in seconds |
 | `arrangements` | list | yes | Playable arrangements (see §2.1) |
 | `stems` | list | yes | Audio stems (see §2.2) |
-| `stem_separation` | object | no | Structured metadata when stems were produced by an automated separation engine (currently `demucs`). Shape: `{engine, model, version}`. See §2.2 for fields + semver semantics per [slopsmith#357](https://github.com/byrongamatos/slopsmith/issues/357). Omitted for single-stem sloppaks (`stems: [{id: full, ...}]`) and hand-edited stems |
+| `stem_separation` | object | no | Structured metadata when stems were produced by an automated separation engine (currently `demucs`). Shape: `{engine, model, version}`. See §2.2 for fields + semver semantics per [slopsmith#357](https://github.com/byrongamatos/slopsmith/issues/357). Omitted for single-stem sloppaks (`stems: [{id: full, ...}]`) and for hand-edited / user-recorded stems |
 | `lyrics` | string | no | Path to lyrics JSON |
 | `lyrics_source` | string | no | Where the lyrics came from: `xml` (Rocksmith vocals.xml), `sng` (encrypted Rocksmith vocals.sng), `whisperx` (auto-transcribed), or `user` (hand-edited). Absent on legacy sloppaks — readers should treat missing as `xml` |
 | `lyric_transcription` | object | no | Structured metadata when lyrics came from an automated engine (currently `whisperx`). Mirrors the `stem_separation` shape — see §2.3 |

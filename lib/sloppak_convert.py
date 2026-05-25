@@ -876,9 +876,13 @@ def _rewrite_stems_manifest(
     a separate `stem_authoring` sibling for that case (deferred to a
     follow-up).
 
-    Removes the existing key when explicitly cleared so re-running a
-    different-engine split (or a hand-edit pass) on top of an existing
-    Demucs split doesn't leave stale provenance behind."""
+    When `stem_separation` is `None` (the default — either because the
+    kwarg was omitted or because the caller explicitly passed None), any
+    existing `stem_separation` key in the manifest is removed. That way
+    a hand-edit pass / single-stem rewrite on top of a previously
+    auto-split sloppak doesn't leave stale provenance behind: the
+    absence of the kwarg IS the signal to clear, no separate
+    "explicit clear" path needed."""
     mf = source_dir / "manifest.yaml"
     if not mf.exists():
         mf = source_dir / "manifest.yml"
