@@ -964,9 +964,11 @@ def _maybe_transcribe_lyrics(
       1. `enabled` is True (explicit per-invocation override, or
          `whisperx.enabled` from converter config).
       2. The Demucs split produced a `vocals.ogg` stem.
-      3. Existing `lyrics.json` is absent (fallback-only semantics).
-         `force=True` bypasses this — used by the retroactive CLI
-         to overwrite Rocksmith lyrics on user request.
+      3. The sloppak has no manifest-declared lyrics file (resolved
+         via `_existing_lyrics_path()`; not a hardcoded
+         `lyrics.json` check). Fallback-only semantics — `force=True`
+         bypasses this, used by the retroactive CLI to overwrite
+         existing lyrics on user request.
       4. The vocals stem has signal above the configured RMS threshold
          (skip instrumentals — Whisper hallucinates on near-silent
          input).
@@ -1215,8 +1217,9 @@ def split_sloppak_stems(
     that runs after stems are split. `None` (default) defers to the
     `whisperx.enabled` flag in the converter config; `True` / `False`
     is an explicit per-invocation override. Transcription only fires
-    when Demucs produced a `vocals.ogg` and the sloppak has no
-    existing `lyrics.json`."""
+    when Demucs produced a `vocals.ogg` AND the sloppak has no
+    manifest-declared lyrics file on disk (gate resolved via
+    `_existing_lyrics_path()`, not a hardcoded `lyrics.json` check)."""
     if sloppak_path.is_dir():
         _split_in_dir(sloppak_path, model, progress_cb, base_frac, span_frac,
                       transcribe_lyrics=transcribe_lyrics)

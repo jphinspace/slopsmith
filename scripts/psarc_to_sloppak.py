@@ -94,23 +94,17 @@ def _wem_to_ogg(wem_path: str, out_ogg: Path) -> None:
 
 
 def _parse_lyrics(extracted_dir: Path) -> list[dict]:
-    """Return compact-wire lyric tokens from any vocals XML in the extract."""
-    for xml_path in sorted(extracted_dir.rglob("*.xml")):
-        try:
-            root = ET.parse(xml_path).getroot()
-        except Exception:
-            continue
-        if root.tag != "vocals":
-            continue
-        out: list[dict] = []
-        for v in root.findall("vocal"):
-            out.append({
-                "t": round(float(v.get("time", "0")), 3),
-                "d": round(float(v.get("length", "0")), 3),
-                "w": v.get("lyric", ""),
-            })
-        return out
-    return []
+    """Return compact-wire lyric tokens from vocals XML OR SNG in the extract.
+
+    Delegates to the library implementation (`lib/sloppak_convert.py`)
+    so this script stays in lockstep with it — official DLC ships
+    vocals only in SNG form, and an XML-only parse would falsely
+    report "no lyrics" on those PSARCs, which would in turn make the
+    --auto-lyrics flag transcribe over the real authored lyrics. The
+    lib version also handles platform routing (PC vs Mac SNG keys)
+    and the lyrics_source provenance the manifest expects."""
+    from sloppak_convert import _parse_lyrics as _lib_parse_lyrics
+    return _lib_parse_lyrics(extracted_dir)
 
 
 def _extract_cover(extracted_dir: Path, out_jpg: Path) -> bool:

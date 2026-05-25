@@ -12,10 +12,14 @@ Behaviour by input state:
   2. Sloppak only has stems/full.ogg     → run Demucs to extract vocals,
                                             then transcribe. Keeps other
                                             split stems as a side effect.
-  3. Sloppak already has lyrics.json     → skip with a message; pass
-                                            --force to overwrite (the
-                                            v1 fallback-only default is
-                                            opt-out via this flag).
+  3. Sloppak already has lyrics          → skip with a message; pass
+     (any manifest-declared path,         --force to overwrite (the
+     not just lyrics.json)                v1 fallback-only default is
+                                          opt-out via this flag). On
+                                          overwrite, the fresh transcript
+                                          always lands at canonical
+                                          stems/lyrics.json and the
+                                          manifest gets repointed.
 
 Requires whisperx for the local path, or a configured remote demucs server
 (which hosts /align too) via $CONFIG_DIR/config.json:
