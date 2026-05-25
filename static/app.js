@@ -4464,6 +4464,13 @@ async function playSong(filename, arrangement) {
     document.getElementById('quality-select').value = highway.getRenderScale();
 }
 
+// Generation token + safety-timeout handle for changeArrangement's
+// aria-busy gate. Module-scoped so a newer invocation cancels the
+// previous one's pending timeout (and its _onReady callback bails when
+// the gen has moved on) rather than clearing aria-busy for itself.
+let _arrBusyGen = 0;
+let _arrBusyTimeout = null;
+
 async function changeArrangement(index) {
     if (currentFilename) {
         const wasPlaying = isPlaying;
@@ -4473,6 +4480,24 @@ async function changeArrangement(index) {
             else audio.pause();
             isPlaying = false;
         }
+
+        // Audio is paused, but the play button is intentionally left
+        // showing its pre-load state to avoid flicker if auto-resume
+        // succeeds. Tell assistive tech to wait until the load +
+        // seek-restore + auto-resume settles before re-announcing the
+        // button so screen readers don't briefly advertise stale state.
+        // Pair with a safety timeout so a websocket/server failure that
+        // never reaches `ready` can't leave the button perpetually busy.
+        const myGen = ++_arrBusyGen;
+        const playBtn = document.getElementById('btn-play');
+        if (playBtn) playBtn.setAttribute('aria-busy', 'true');
+        if (_arrBusyTimeout !== null) clearTimeout(_arrBusyTimeout);
+        _arrBusyTimeout = setTimeout(() => {
+            if (myGen !== _arrBusyGen) return;
+            _arrBusyTimeout = null;
+            const b = document.getElementById('btn-play');
+            if (b) b.removeAttribute('aria-busy');
+        }, 30000);
 
         // Show loading overlay
         let overlay = document.getElementById('arr-loading');
@@ -4487,10 +4512,33 @@ async function changeArrangement(index) {
             </div>`;
         document.body.appendChild(overlay);
 
-        // Set callback for when data is ready
-        highway._onReady = async () => {
+        // Set callback for when data is ready. Capture the function ref
+        // so a stale older invocation firing after a newer changeArrangement
+        // has installed its own callback can't clobber the newer one.
+        const myCallback = async () => {
+            // Bail in full if this invocation has been superseded. The newer
+            // changeArrangement owns the overlay (same id), its own _onReady,
+            // and the aria-busy gate; this old callback must not touch any
+            // of them.
+            if (myGen !== _arrBusyGen) return;
             const ol = document.getElementById('arr-loading');
             if (ol) ol.remove();
+            const clearBusy = () => {
+                // Double-checked because a newer invocation could land
+                // during the await below.
+                if (myGen !== _arrBusyGen) return;
+                if (_arrBusyTimeout !== null) {
+                    clearTimeout(_arrBusyTimeout);
+                    _arrBusyTimeout = null;
+                }
+                const b = document.getElementById('btn-play');
+                if (b) b.removeAttribute('aria-busy');
+            };
+            const clearMyCallback = () => {
+                // Only null out if the slot still points at us; a newer
+                // invocation may have replaced it during the await.
+                if (highway._onReady === myCallback) highway._onReady = null;
+            };
             const r = await _audioSeek(time, 'arrangement-restore');
             // Don't auto-resume on cancel OR off-target landing — same
             // 50 ms tolerance as loop-wrap / loop-set. Resuming play from
@@ -4511,7 +4559,8 @@ async function changeArrangement(index) {
                         window.slopsmith.emit('song:pause', _songEventPayload());
                     }
                 }
-                highway._onReady = null;
+                clearBusy();
+                clearMyCallback();
                 return;
             }
             if (wasPlaying) {
@@ -4524,8 +4573,10 @@ async function changeArrangement(index) {
                     }
                 } else audio.play().then(() => { isPlaying = true; }).catch(() => {});
             }
-            highway._onReady = null;
+            clearBusy();
+            clearMyCallback();
         };
+        highway._onReady = myCallback;
 
         highway.reconnect(currentFilename, index);
         window.slopsmith.emit('arrangement:changed', { index, filename: currentFilename });
