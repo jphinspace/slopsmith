@@ -542,6 +542,18 @@ def convert_psarc_to_sloppak(
 
 _STEM_ORDER = ["guitar", "bass", "drums", "vocals", "piano", "other"]
 
+# `stem_separation` manifest block constants per slopsmith#357. Engine id is
+# stable per the RFC ("demucs" is the only stem separator we currently call).
+# Schema version follows the same patch/minor/major semantics as
+# `lyric_transcription` (see lyrics_transcribe.py):
+#   * patch — metadata-only or implementation fixes; no regeneration
+#   * minor — backward-compatible additions
+#   * major — output shape / semantics changed; existing splits should
+#            be regenerated (and a remote cache should miss)
+# Independent from upstream demucs / htdemucs model versions.
+STEM_SEPARATION_ENGINE = "demucs"
+STEM_SEPARATION_SCHEMA_VERSION = "1.0.0"
+
 
 def demucs_available() -> bool:
     try:
@@ -848,12 +860,34 @@ def _encode_ogg(wav_path: Path, ogg_path: Path) -> None:
         )
 
 
-def _rewrite_stems_manifest(source_dir: Path, new_stems: list[dict]) -> None:
+def _rewrite_stems_manifest(
+    source_dir: Path,
+    new_stems: list[dict],
+    *,
+    stem_separation: dict | None = None,
+) -> None:
+    """Rewrite manifest's `stems` list (+ optionally `stem_separation` block).
+
+    `stem_separation` is the engine / model / version metadata block
+    proposed by slopsmith#357. Pass it (only) when stems were produced
+    by an automated separator (Demucs) so consumers + remote caches
+    can tell whether two split artifacts are comparable. Hand-edited /
+    user-recorded stems should NOT carry this block — the RFC reserves
+    a separate `stem_authoring` sibling for that case (deferred to a
+    follow-up).
+
+    Removes the existing key when explicitly cleared so re-running a
+    different-engine split (or a hand-edit pass) on top of an existing
+    Demucs split doesn't leave stale provenance behind."""
     mf = source_dir / "manifest.yaml"
     if not mf.exists():
         mf = source_dir / "manifest.yml"
     data = yaml.safe_load(mf.read_text(encoding="utf-8")) or {}
     data["stems"] = new_stems
+    if stem_separation is not None:
+        data["stem_separation"] = stem_separation
+    else:
+        data.pop("stem_separation", None)
     mf.write_text(
         yaml.safe_dump(data, sort_keys=False, allow_unicode=True),
         encoding="utf-8",
@@ -1205,7 +1239,19 @@ def _split_in_dir(
         )
 
     full_ogg.unlink(missing_ok=True)
-    _rewrite_stems_manifest(source_dir, produced)
+    # Stamp `stem_separation` metadata per slopsmith#357: which engine /
+    # model / artifact-schema-version produced these stems. Lets remote
+    # caches key on the full block (cache miss when any field changes)
+    # and lets UI / diagnostics surface which separator was used.
+    # `model` is the requested model — the remote demucs server *should*
+    # honor it; introspecting the server's actual choice is a follow-up
+    # parallel to the same gap on `lyric_transcription.model`.
+    stem_separation_meta = {
+        "engine": STEM_SEPARATION_ENGINE,
+        "model": model,
+        "version": STEM_SEPARATION_SCHEMA_VERSION,
+    }
+    _rewrite_stems_manifest(source_dir, produced, stem_separation=stem_separation_meta)
 
     # Final flush so the caller's progress printer / UI bar always reaches
     # base_frac + span_frac for this stage, even when the transcription

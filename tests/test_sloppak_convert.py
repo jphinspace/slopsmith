@@ -671,3 +671,73 @@ def test_cleanup_stale_temp_dirs_skips_symlinks(tmp_path, monkeypatch):
     assert removed == 0
     assert link.exists()
     assert target.exists() and (target / "do_not_delete.txt").exists()
+
+
+# ── stem_separation manifest block (slopsmith#357) ─────────────────────────
+
+
+def _write_minimal_manifest(source_dir):
+    """Seed a tiny valid manifest so _rewrite_stems_manifest has something
+    to read + rewrite."""
+    import yaml
+    mf = source_dir / "manifest.yaml"
+    mf.write_text(
+        yaml.safe_dump({
+            "title": "Test",
+            "artist": "Test",
+            "duration": 1.0,
+            "arrangements": [],
+            "stems": [{"id": "full", "file": "stems/full.ogg", "default": True}],
+        }, sort_keys=False),
+        encoding="utf-8",
+    )
+
+
+def test_rewrite_stems_manifest_writes_stem_separation_block(tmp_path):
+    """The new `stem_separation` block lands as a top-level manifest key
+    when split_sloppak_stems' rewrite path passes it."""
+    import yaml
+    _write_minimal_manifest(tmp_path)
+    new_stems = [
+        {"id": "vocals", "file": "stems/vocals.ogg", "default": "on"},
+        {"id": "drums",  "file": "stems/drums.ogg",  "default": "on"},
+    ]
+    sloppak_convert._rewrite_stems_manifest(
+        tmp_path, new_stems,
+        stem_separation={"engine": "demucs", "model": "htdemucs_6s", "version": "1.0.0"},
+    )
+    data = yaml.safe_load((tmp_path / "manifest.yaml").read_text(encoding="utf-8"))
+    assert data["stems"] == new_stems
+    assert data["stem_separation"] == {
+        "engine": "demucs",
+        "model": "htdemucs_6s",
+        "version": "1.0.0",
+    }
+
+
+def test_rewrite_stems_manifest_omits_block_when_not_passed(tmp_path):
+    """Single-stem / hand-edited paths don't pass stem_separation —
+    the manifest stays clean (no surprise key, and any prior stale
+    block gets cleared)."""
+    import yaml
+    _write_minimal_manifest(tmp_path)
+    # Seed a stale stem_separation block to prove it gets cleared
+    mf = tmp_path / "manifest.yaml"
+    seeded = yaml.safe_load(mf.read_text(encoding="utf-8"))
+    seeded["stem_separation"] = {"engine": "stale", "model": "old", "version": "0.0.0"}
+    mf.write_text(yaml.safe_dump(seeded, sort_keys=False), encoding="utf-8")
+
+    sloppak_convert._rewrite_stems_manifest(
+        tmp_path,
+        [{"id": "full", "file": "stems/full.ogg", "default": "on"}],
+    )
+    data = yaml.safe_load(mf.read_text(encoding="utf-8"))
+    assert "stem_separation" not in data
+
+
+def test_stem_separation_constants_are_stable():
+    """Pin the constants so a refactor that silently bumps the engine
+    name or schema version trips this test instead of shipping a wire
+    break to consumers / remote caches."""
+    assert sloppak_convert.STEM_SEPARATION_ENGINE == "demucs"
+    assert sloppak_convert.STEM_SEPARATION_SCHEMA_VERSION == "1.0.0"

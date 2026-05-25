@@ -78,9 +78,10 @@ Full set of currently-recognized top-level keys:
 | `duration` | float | yes | Song length in seconds |
 | `arrangements` | list | yes | Playable arrangements (see §2.1) |
 | `stems` | list | yes | Audio stems (see §2.2) |
+| `stem_separation` | object | no | Structured metadata when stems were produced by an automated separation engine (currently `demucs`). Shape: `{engine, model, version}`. See §2.2 for fields + semver semantics per [slopsmith#357](https://github.com/byrongamatos/slopsmith/issues/357). Omitted for single-stem sloppaks (`stems: [{id: full, ...}]`) and hand-edited stems |
 | `lyrics` | string | no | Path to lyrics JSON |
 | `lyrics_source` | string | no | Where the lyrics came from: `xml` (Rocksmith vocals.xml), `sng` (encrypted Rocksmith vocals.sng), `whisperx` (auto-transcribed), or `user` (hand-edited). Absent on legacy sloppaks — readers should treat missing as `xml` |
-| `lyric_transcription` | object | no | Structured metadata when lyrics came from an automated engine (currently `whisperx`). Same shape as the parent `stem_separation` block defined by [slopsmith#357](https://github.com/byrongamatos/slopsmith/issues/357) — see §2.3 for fields and semver semantics. Omitted for authored lyrics (`xml`/`sng`/`user`) |
+| `lyric_transcription` | object | no | Structured metadata when lyrics came from an automated engine (currently `whisperx`). Mirrors the `stem_separation` shape — see §2.3 |
 | `cover` | string | no | Path to cover image |
 
 Unknown keys are **silently ignored** by the loader. This is deliberate — it's the extensibility hook (see §5).
@@ -120,6 +121,24 @@ stems:
 - `id` is referenced by the Stems plugin and any other consumer; keep it stable.
 - `default` accepts `true`/`false`, or strings (`"on"`/`"off"`/`"true"`/etc.) for hand-edited manifests.
 - A freshly converted sloppak from `lib/sloppak_convert.py` starts with a single `{id: full, file: stems/full.ogg, ...}` entry. After stem-splitting (Demucs), `full.ogg` is removed and the manifest is rewritten with per-instrument entries (`guitar`, `bass`, `drums`, `vocals`, `other`). The format requires only that `stems` is non-empty — there's no specific filename or id that must always be present.
+
+When stems were produced by an automated separation engine (Demucs), an optional `stem_separation` block records which engine + model produced them. Per [slopsmith#357](https://github.com/byrongamatos/slopsmith/issues/357):
+
+```yaml
+stem_separation:
+  engine: demucs           # stable engine id; only `demucs` today
+  model: htdemucs_6s       # specific model name (htdemucs_6s / htdemucs_ft / htdemucs / mdx_extra / ...)
+  version: 1.0.0           # semver for slopsmith's stem-artifact contract
+```
+
+Fields:
+- `engine` — stable identifier for the separation engine. Currently always `demucs`. New engines (e.g. a hypothetical `spleeter`) would get their own stable id.
+- `model` — the engine-specific model id used for this split. For Demucs this is the `-n` flag value.
+- `version` — semver for Slopsmith's stem-artifact contract (independent of upstream Demucs / model versions). Bump per the same semantics #357 defines: patch = metadata-only fixes, minor = backward-compatible additions, major = stem set / packing / post-processing changed and existing splits should be regenerated.
+
+Omitted for single-stem sloppaks (`stems: [{id: full, ...}]` — no automated separation ran) and for hand-edited / user-recorded stems. The RFC reserves a separate `stem_authoring` sibling block for the hand-edit case; that's deferred to a follow-up.
+
+A remote Demucs server can use this block as part of a cache key so that changing the model or major version naturally produces a cache miss. Local plugin jobs should preserve this metadata in job state and in any copied/downloaded manifests.
 
 ### 2.3. `lyrics`
 
