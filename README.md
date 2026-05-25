@@ -412,6 +412,7 @@ Routes are registered under `/api/plugins/{plugin_id}/` to avoid conflicts.
 | [Simplify Chords](https://github.com/bkranendonk/slopsmith-plugin-simplify-chords)  | Changes complex chords on the note highway to simpler ones. Inspired by Ultimate Guitar's Simplify button. | `git clone ...slopsmith-plugin-simplify-chords.git simplify-chords`     |
 | [Key Bindings](https://github.com/jackipicco/slopsmith-plugin-key-bindings)  | Highway key bindings for keyboard and TV remote| `git clone ...slopsmith-plugin-key-bindings.git key_bindings`     |
 | [Folder Organizer](https://github.com/Elit3d/slopsmith-plugin-folder-organizer) | Organize your sloppak DLC songs into a folder tree view, grouped by subfolder name | `git clone ...slopsmith-plugin-folder-organizer.git folder-organizer`     |
+| [NAM Rig Builder](https://github.com/Jafz2001/slopsmith-plugin-nam-rig-builder) | Map Rocksmith tones to chained NAM neural-amp rigs (tone3000 captures + IRs) — full pedal→amp→cab playback, per-stage bypass, and a gear catalog | `git clone ...slopsmith-plugin-nam-rig-builder.git nam_rig_builder` |
 
 
 Install any plugin by cloning it into your `plugins/` directory and restarting:
