@@ -713,20 +713,23 @@ def test_smart_names_single_bass():
 
 
 def test_smart_names_lead_and_alt_lead():
+    # represent=1 → standard ("Lead"); represent=0 → alternate ("Alt. Lead")
     arrs = [
-        _sarr(path_lead=True, represent=0),
-        _sarr(path_lead=True, represent=1),
+        _sarr(path_lead=True, represent=0),   # index 0 → Alt. Lead
+        _sarr(path_lead=True, represent=1),   # index 1 → Lead (standard)
     ]
-    assert compute_smart_names(arrs) == ["Lead", "Alt. Lead"]
+    assert compute_smart_names(arrs) == ["Alt. Lead", "Lead"]
 
 
 def test_smart_names_three_leads_main():
+    # represent=1 → Lead; represent=0 and represent=2 → Alt. Lead 1 / 2
+    # Alts are sorted by represent ascending: 0 comes before 2.
     arrs = [
-        _sarr(path_lead=True, represent=0),
-        _sarr(path_lead=True, represent=1),
-        _sarr(path_lead=True, represent=2),
+        _sarr(path_lead=True, represent=0),   # index 0 → Alt. Lead 1
+        _sarr(path_lead=True, represent=1),   # index 1 → Lead (standard)
+        _sarr(path_lead=True, represent=2),   # index 2 → Alt. Lead 2
     ]
-    assert compute_smart_names(arrs) == ["Lead", "Alt. Lead 1", "Alt. Lead 2"]
+    assert compute_smart_names(arrs) == ["Alt. Lead 1", "Lead", "Alt. Lead 2"]
 
 
 def test_smart_names_single_bonus_lead():
@@ -743,6 +746,11 @@ def test_smart_names_two_bonus_leads():
 
 def test_smart_names_full_mix():
     # 1 lead + 1 alt lead + 1 bonus lead + 1 rhythm + 1 bass
+    # index 0: represent=0 → Alt. Lead
+    # index 1: represent=1 → Lead (standard)
+    # index 2: bonus_arr → Bonus Lead
+    # index 3: represent=0, single rhythm → Rhythm (fallback: no represent=1)
+    # index 4: represent=0, single bass   → Bass   (fallback: no represent=1)
     arrs = [
         _sarr(path_lead=True, represent=0),
         _sarr(path_lead=True, represent=1),
@@ -751,7 +759,7 @@ def test_smart_names_full_mix():
         _sarr(path_bass=True, represent=0, name="Bass"),
     ]
     assert compute_smart_names(arrs) == [
-        "Lead", "Alt. Lead", "Bonus Lead", "Rhythm", "Bass"
+        "Alt. Lead", "Lead", "Bonus Lead", "Rhythm", "Bass"
     ]
 
 
@@ -797,13 +805,14 @@ def test_smart_names_path_flags_take_priority_over_name():
 
 
 def test_smart_names_represent_ordering():
-    # Lower represent value gets the primary slot even when added second
+    # Neither arrangement has represent=1, so the fallback applies:
+    # sort alts by represent ascending and promote the first as standard.
+    # represent=2 (index 1) < represent=5 (index 0) → index 1 becomes "Lead".
     arrs = [
         _sarr(path_lead=True, represent=5),
         _sarr(path_lead=True, represent=2),
     ]
     names = compute_smart_names(arrs)
-    # represent=2 is index 1 → "Lead"; represent=5 is index 0 → "Alt. Lead"
     assert names[0] == "Alt. Lead"
     assert names[1] == "Lead"
 

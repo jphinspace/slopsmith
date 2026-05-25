@@ -434,24 +434,43 @@ def compute_smart_names(arrangements: list[Arrangement]) -> list[str | None]:
         if not type_arrs:
             continue
 
-        main_arrs = sorted(
-            [(i, a) for i, a in type_arrs if not a.bonus_arr],
+        # Main group (bonusArr=False):
+        #   represent=1 → standard arrangement ("Lead")
+        #   represent=0 (or any value != 1) → alternate arrangement ("Alt. Lead")
+        #
+        # If no arrangement has represent=1 (e.g. CDLC defaults or all-zero
+        # flags with name fallback), fall back to treating the first by
+        # represent-ascending order as the standard so there is always a "Lead".
+        main_pairs = [(i, a) for i, a in type_arrs if not a.bonus_arr]
+        standard = [(i, a) for i, a in main_pairs if a.represent == 1]
+        alts = sorted(
+            [(i, a) for i, a in main_pairs if a.represent != 1],
             key=lambda x: x[1].represent,
         )
+        if not standard and alts:
+            standard = [alts[0]]
+            alts = alts[1:]
+        # Guard: if somehow multiple represent=1 exist, promote only the first.
+        if len(standard) > 1:
+            extra = sorted(standard[1:], key=lambda x: x[1].represent)
+            alts = sorted(extra + alts, key=lambda x: x[1].represent)
+            standard = standard[:1]
+
+        for i, _ in standard:
+            result[i] = label
+
+        n_alts = len(alts)
+        for j, (i, _) in enumerate(alts):
+            if n_alts == 1:
+                result[i] = f"Alt. {label}"
+            else:
+                result[i] = f"Alt. {label} {j + 1}"
+
+        # Bonus group (bonusArr=True): sorted by represent ascending.
         bonus_arrs = sorted(
             [(i, a) for i, a in type_arrs if a.bonus_arr],
             key=lambda x: x[1].represent,
         )
-
-        n_alts = len(main_arrs) - 1
-        for j, (i, _) in enumerate(main_arrs):
-            if j == 0:
-                result[i] = label
-            elif n_alts == 1:
-                result[i] = f"Alt. {label}"
-            else:
-                result[i] = f"Alt. {label} {j}"
-
         n_bonus = len(bonus_arrs)
         for j, (i, _) in enumerate(bonus_arrs):
             if n_bonus == 1:
