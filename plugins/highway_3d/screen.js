@@ -25,12 +25,19 @@
     // all index safely. Default is the canonical Rocksmith classic
     // mapping (low E=red, A=yellow, D=blue, G=orange, B=green,
     // high E=purple); Neon pushes saturation harder; Pastel desaturates
-    // for long-session comfort. In slopsmith's index convention
-    // s=0 is the low E (thickest) and s=5 is the high E (thinnest),
-    // matching Rocksmith's native string indexing. Per-index ordering
-    // is preserved across all three palettes so switching between them
-    // never reassigns a string to a different colour family. Indices
-    // 6/7 are supplementary slots used for 7/8-string arrangements.
+    // for long-session comfort; Colorblind (high contrast) is derived from
+    // Rocksmith 2014's built-in colorblind-mode palette, but this preset
+    // intentionally keeps some entries tuned for slopsmith rather than
+    // reproducing every original game hex value verbatim. The RS2014 base
+    // values came from the RSMods author's reverse-engineering of the game
+    // files; do not treat the tuned values below as the exact in-game
+    // palette.
+    // In slopsmith's index convention s=0 is the low E (thickest) and
+    // s=5 is the high E (thinnest), matching Rocksmith's native string
+    // indexing. Per-index ordering is preserved across all palettes so
+    // switching between them never reassigns a string to a different
+    // colour family. Indices 6/7 are supplementary slots used for
+    // 7/8-string arrangements.
     // NOTE: settings.html mirrors these arrays in its hydration script
     // for the palette-preview swatches — keep them in sync.
     const PALETTES = {
@@ -46,8 +53,16 @@
             0xe89aa0, 0xefdf90, 0x9adfee, 0xefb898,
             0xa6e0a8, 0xc4a6e0, 0xe0a6c8, 0xa6e0d8,
         ],
+        colorblind_hc: [
+            0xa42424, 0xa3f300, 0x19abfc, 0xda7e41,
+            0x30d0a0, 0x7648a7, 0xff6bd5, 0x6bffe6,
+        ],
     };
     const PALETTE_IDS = Object.keys(PALETTES);
+    // Host-facing display names for the panelControls palette descriptor.
+    // Single-word ids fall back to a capitalized id (Default/Neon/Pastel);
+    // multi-word ids that need a real name are overridden here.
+    const PALETTE_LABELS = { colorblind_hc: 'Colorblind (high contrast)' };
     // Default palette at module scope so out-of-IIFE consumers (e.g. the
     // out-of-range warning's reference to "palette size") still have a
     // canonical length to compare against.
@@ -771,9 +786,55 @@
     // silence playback. The leak (one AudioContext + one AnalyserNode,
     // a few KB) is the cost of having a plugin tap audio at all.
     let _bgAudio = null;
+    // The core (#audio-tap) cache is held separately from the stems cache so
+    // we can switch back to it without re-calling createMediaElementSource on
+    // #audio — that call is one-shot per element, and a second one throws
+    // InvalidStateError (which would then be marked permanent and disable
+    // reactivity forever on PSARC songs after any sloppak detour).
+    let _bgAudioCore = null;
     let _bgAudioFailedAt = 0;  // performance.now() of last failure, 0 = never
     const _BG_AUDIO_RETRY_MS = 1000;
+    // _bgReadBands sums bins 0..7 (bass), 8..39 (mid), 40..127 (treble),
+    // so the frequency buffer must hold at least 128 bins regardless of
+    // the source analyser's fftSize.
+    const BG_FREQ_BINS = 128;
     function _bgGetAnalyser() {
+        // Prefer the stems plugin's side-chain analyser when a sloppak is
+        // loaded. As of slopsmith-plugin-stems 0.5.0 (sample-locked playback)
+        // the #audio element is a silent virtual transport on sloppaks, so
+        // tapping it sees only silence; the stems mix is exposed at
+        // window.slopsmith.stems.getAnalyser() instead. The stems plugin
+        // creates and destroys that AnalyserNode per song, so we re-check
+        // each call and key the cache on its identity — when the node
+        // changes (song switch), the cache is replaced automatically.
+        const stemsApi = window.slopsmith && window.slopsmith.stems;
+        const stemsAnalyser = (stemsApi && typeof stemsApi.getAnalyser === 'function')
+            ? stemsApi.getAnalyser() : null;
+        if (stemsAnalyser) {
+            if (!_bgAudio || _bgAudio.source !== 'stems' || _bgAudio.analyser !== stemsAnalyser) {
+                // Adopt the live stems analyser. Do NOT close its context — it's
+                // shared with stem playback and the stems plugin owns its
+                // lifecycle. No play-event resume hooks either; the stems
+                // plugin manages context resume itself.
+                _bgAudio = {
+                    ctx: stemsAnalyser.context,
+                    analyser: stemsAnalyser,
+                    // _bgReadBands reads bins 0..127 unconditionally. Always
+                    // allocate at least 128 bytes so a smaller analyser (e.g.
+                    // fftSize < 256) can't leave undefined values in the loop.
+                    freq: new Uint8Array(Math.max(BG_FREQ_BINS, stemsAnalyser.frequencyBinCount)),
+                    source: 'stems',
+                };
+            }
+            return _bgAudio;
+        }
+        // No sloppak active — drop a stale stems-sourced cache, restoring the
+        // core-tap cache if we'd already built one. Without this, the next
+        // step would try to createMediaElementSource(#audio) a second time
+        // (one-shot per element) and throw InvalidStateError — disabling
+        // reactivity for the rest of the page lifetime.
+        if (_bgAudio && _bgAudio.source === 'stems') _bgAudio = _bgAudioCore;
+
         if (_bgAudio && !_bgAudio.failed) return _bgAudio;
         if (_bgAudio && _bgAudio.failed) {
             // Distinguish permanent failures from transient ones.
@@ -801,7 +862,11 @@
             analyser.fftSize = 256;
             source.connect(analyser);
             analyser.connect(ctx.destination);
-            _bgAudio = { ctx, analyser, freq: new Uint8Array(analyser.frequencyBinCount) };
+            _bgAudio = { ctx, analyser, freq: new Uint8Array(Math.max(BG_FREQ_BINS, analyser.frequencyBinCount)), source: 'core' };
+            // Remember the core analyser so a later stems-then-back-to-core
+            // transition can re-use it instead of re-tapping #audio (which
+            // would throw InvalidStateError on the one-shot per element).
+            _bgAudioCore = _bgAudio;
             // Browsers with autoplay restrictions hand back a suspended
             // AudioContext; createMediaElementSource then routes the
             // <audio> through that suspended graph and playback goes
@@ -9069,20 +9134,63 @@
     }
 
     window.slopsmithViz_highway_3d = createFactory;
-    // Static metadata read by core (see static/highway.js + static/app.js):
-    //   contextType         — required canvas context type. highway.js
-    //                         replaces the <canvas> element when the
-    //                         requested type differs from the current one,
-    //                         so this renderer can be installed mid-session
-    //                         even if the canvas was previously bound to 2D.
-    //   matchesArrangement  — Auto-mode predicate. When the picker is on
-    //                         "Auto", core installs the first registered
-    //                         viz whose predicate returns truthy on the
-    //                         current song_info. Lead/Rhythm/Bass/Guitar
-    //                         arrangements route here; Keys arrangements
-    //                         are matched by the piano plugin instead.
-    //                         _canRun3D() in app.js still gates Auto from
-    //                         picking us on machines without WebGL2.
+    window.slopsmithViz_highway_3d.panelControls = [
+        {
+            key: 'palette',
+            label: 'Palette',
+            type: 'select',
+            default: BG_DEFAULTS.palette,
+            // Derived from PALETTE_IDS so the descriptor stays in sync when a
+            // palette is added/removed/renamed — PALETTES is the single
+            // source of truth. Label uses PALETTE_LABELS where set, else the
+            // capitalized id (matches the Default/Neon/Pastel names).
+            options: PALETTE_IDS.map((id) => ({
+                id,
+                label: PALETTE_LABELS[id] || (id.charAt(0).toUpperCase() + id.slice(1)),
+            })),
+        },
+        {
+            key: 'cameraSmoothing',
+            label: 'Camera smoothing (X-pan)',
+            type: 'range',
+            min: 0,
+            max: 1,
+            step: 0.05,
+            default: BG_DEFAULTS.cameraSmoothing,
+        },
+        {
+            key: 'cameraLockLow',
+            label: 'Lock camera at frets 1-12',
+            type: 'toggle',
+            default: BG_DEFAULTS.cameraLockLow,
+        },
+        {
+            key: 'cameraLockZoom',
+            label: 'Locked zoom (In ↔ Out)',
+            type: 'range',
+            min: 0,
+            max: 1,
+            step: 0.05,
+            default: BG_DEFAULTS.cameraLockZoom,
+        },
+    ];
+    // Static metadata exposed on the factory:
+    //   panelControls      - optional, host-readable descriptors for a
+    //                        curated per-panel control surface. Renderer
+    //                        values still flow through _bgLoadSettings().
+    //   contextType        - required canvas context type. highway.js
+    //                        replaces the <canvas> element when the
+    //                        requested type differs from the current one,
+    //                        so this renderer can be installed mid-session
+    //                        even if the canvas was previously bound to 2D.
+    //   matchesArrangement - Auto-mode predicate. When the picker is on
+    //                        "Auto", core installs the first registered
+    //                        viz whose predicate returns truthy on the
+    //                        current song_info. Lead/Rhythm/Bass/Guitar
+    //                        arrangements route here; Keys arrangements
+    //                        are matched by the piano plugin instead.
+    //                        _canRun3D() in app.js still gates Auto from
+    //                        picking us on machines without WebGL2.
     window.slopsmithViz_highway_3d.contextType = 'webgl2';
     // Canonical guitar arrangement names (server.py: _ALLOWED_ARRANGEMENT_NAMES)
     // are Lead / Rhythm / Bass / Combo. `guitar` is included as a safety

@@ -15,6 +15,7 @@ services:
       - ./ug_browser.py:/app/ug_browser.py
       - ./lib:/app/lib
       - ./plugins:/app/plugins
+      - ./.git:/app/.git:ro
       # Optional: mount Firefox profile for CustomsForge auth
       # - ~/.mozilla/firefox:/firefox:ro
     environment:

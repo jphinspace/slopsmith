@@ -10,9 +10,11 @@ See issue #46 (tempo math) and the GP repeat-expansion PR for the schedule
 walker.
 """
 
+import xml.etree.ElementTree as ET
 from types import SimpleNamespace
 from unittest import mock
 
+import guitarpro
 import pytest
 
 from gp2rs import (
@@ -26,6 +28,8 @@ from gp2rs import (
     _standard_tuning_for,
     _tempo_at_tick,
     _tick_to_seconds,
+    convert_piano_track,
+    convert_track,
 )
 
 
@@ -568,3 +572,351 @@ def test_schedule_irregular_measure_lengths():
     #   A: 0.0, B: 1.5 (3 q), C: 3.5 (4 q), D pass 0: 5.5 (4 q), D pass 1: 7.5
     out = [round(e.output_start_secs, 3) for e in schedule]
     assert out == [0.0, 1.5, 3.5, 5.5, 7.5]
+
+
+# ── convert_track: tied-note (NoteType.tie) handling ─────────────────────────
+# Tied notes in GP are displayed with brackets, e.g. (0). They should extend
+# the sustain of the previous note on the same string, not emit a second note.
+
+def _ct_note_effect():
+    return SimpleNamespace(
+        bend=None,
+        hammer=False,
+        slides=[],
+        harmonic=None,
+        palmMute=False,
+        accentuatedNote=False,
+        heavyAccentuatedNote=False,
+        ghostNote=False,
+        vibrato=False,
+        tremoloPicking=False,
+    )
+
+
+def _ct_beat(tick, dur_value, notes):
+    return SimpleNamespace(
+        start=tick,
+        duration=SimpleNamespace(
+            value=dur_value,
+            isDotted=False,
+            tuplet=SimpleNamespace(enters=1, times=1),
+        ),
+        notes=notes,
+        effect=SimpleNamespace(mixTableChange=None, chord=None),
+    )
+
+
+def _ct_note(note_type, gp_string, fret):
+    return SimpleNamespace(
+        type=note_type,
+        string=gp_string,
+        value=fret,
+        effect=_ct_note_effect(),
+    )
+
+
+def _ct_song(beats):
+    """One-measure mock song for convert_track, standard 6-string guitar at 120 BPM."""
+    voice = SimpleNamespace(beats=beats)
+    measure = SimpleNamespace(voices=[voice])
+    strings = [SimpleNamespace(number=i + 1, value=v)
+               for i, v in enumerate([64, 59, 55, 50, 45, 40])]
+    track = SimpleNamespace(
+        strings=strings,
+        channel=SimpleNamespace(instrument=24),
+        measures=[measure],
+        name="Guitar",
+    )
+    mh = SimpleNamespace(
+        start=0,
+        number=1,
+        timeSignature=SimpleNamespace(
+            numerator=4,
+            denominator=SimpleNamespace(value=4),
+        ),
+        isRepeatOpen=False,
+        repeatClose=-1,
+        repeatAlternative=0,
+        direction=None,
+        fromDirection=None,
+        marker=None,
+    )
+    return SimpleNamespace(
+        title="Test",
+        artist="Test",
+        album="Test",
+        copyright=None,
+        subtitle=None,
+        tempo=120,
+        tracks=[track],
+        measureHeaders=[mh],
+    )
+
+
+def test_tied_note_extends_sustain_not_duplicate():
+    """NoteType.tie should extend the previous note's sustain, not emit a new note."""
+    # quarter note at 120 BPM = 0.5 s; two tied quarters → 1.0 s total sustain
+    note1 = _ct_note(guitarpro.NoteType.normal, gp_string=1, fret=5)
+    note2 = _ct_note(guitarpro.NoteType.tie, gp_string=1, fret=5)
+    beat1 = _ct_beat(tick=0, dur_value=4, notes=[note1])
+    beat2 = _ct_beat(tick=GP_TICKS_PER_QUARTER, dur_value=4, notes=[note2])
+
+    xml_str = convert_track(_ct_song([beat1, beat2]), track_index=0)
+    root = ET.fromstring(xml_str)  # noqa: S314
+    notes = root.findall(".//notes/note")
+
+    assert len(notes) == 1, f"tie must not emit a second note; got {len(notes)}"
+    sustain = float(notes[0].get("sustain"))
+    assert sustain == pytest.approx(1.0, abs=0.01)
+    assert notes[0].get("fret") == "5"
+
+
+def test_tied_note_without_predecessor_is_silently_dropped():
+    """A tie with no previous note on that string is silently skipped."""
+    note = _ct_note(guitarpro.NoteType.tie, gp_string=1, fret=0)
+    beat = _ct_beat(tick=0, dur_value=4, notes=[note])
+
+    xml_str = convert_track(_ct_song([beat]), track_index=0)
+    root = ET.fromstring(xml_str)  # noqa: S314
+    notes = root.findall(".//notes/note")
+    assert len(notes) == 0
+
+
+def _ct_multivoice_song(voices_beats):
+    """Multi-voice variant of _ct_song. `voices_beats` is a list of beat-lists,
+    one per voice, all on the same single measure."""
+    voices = [SimpleNamespace(beats=beats) for beats in voices_beats]
+    measure = SimpleNamespace(voices=voices)
+    strings = [SimpleNamespace(number=i + 1, value=v)
+               for i, v in enumerate([64, 59, 55, 50, 45, 40])]
+    track = SimpleNamespace(
+        strings=strings,
+        channel=SimpleNamespace(instrument=24),
+        measures=[measure],
+        name="Guitar",
+    )
+    mh = SimpleNamespace(
+        start=0, number=1,
+        timeSignature=SimpleNamespace(numerator=4, denominator=SimpleNamespace(value=4)),
+        isRepeatOpen=False, repeatClose=-1, repeatAlternative=0,
+        direction=None, fromDirection=None, marker=None,
+    )
+    return SimpleNamespace(
+        title="Test", artist="Test", album="Test",
+        copyright=None, subtitle=None, tempo=120,
+        tracks=[track],
+        measureHeaders=[mh],
+    )
+
+
+def test_tie_does_not_attach_to_overwritten_earlier_voice_note():
+    """Voices are processed sequentially. Without an overwrite guard
+    (`rn.time >= existing.time` before updating last_note_per_string),
+    voice 1's beat-0 note would replace voice 0's beat-2 entry in the dict,
+    and voice 1's beat-3 tie would then incorrectly extend voice 1's beat-0
+    sustain across voice 0's beat-2 territory.
+
+    All beat.start values stay within a 4/4 single measure (0 – 3×quarter).
+    """
+    # Voice 0: beat 2 fret 7 (t=1.0, sustain 0.5) — populates dict[string=1] first
+    v0_beat2 = _ct_beat(tick=GP_TICKS_PER_QUARTER * 2, dur_value=4,
+                        notes=[_ct_note(guitarpro.NoteType.normal, gp_string=1, fret=7)])
+    # Voice 1: beat 0 fret 5 (t=0) and tie at beat 3 (t=1.5)
+    v1_beat0 = _ct_beat(tick=0, dur_value=4,
+                        notes=[_ct_note(guitarpro.NoteType.normal, gp_string=1, fret=5)])
+    v1_tie = _ct_beat(tick=GP_TICKS_PER_QUARTER * 3, dur_value=4,
+                      notes=[_ct_note(guitarpro.NoteType.tie, gp_string=1, fret=0)])
+
+    xml_str = convert_track(_ct_multivoice_song([[v0_beat2], [v1_beat0, v1_tie]]),
+                            track_index=0)
+    root = ET.fromstring(xml_str)  # noqa: S314
+    notes = root.findall(".//notes/note")
+
+    sustains = {n.get("fret"): float(n.get("sustain")) for n in notes}
+    # Voice 1's beat-0 (fret 5) sustain must stay at its own duration (~0.5 s).
+    # Without the overwrite guard it would be inflated to ~2.0 s by the tie.
+    assert sustains.get("5") == pytest.approx(0.5, abs=0.01), \
+        "overwrite guard must keep voice 0's beat-2 as the tracked predecessor; " \
+        "voice 1's beat-0 sustain must not balloon to cover the tie's target time"
+
+
+def test_two_normal_notes_on_same_string_are_both_emitted():
+    """Non-tied consecutive notes on the same string each produce a note event."""
+    note1 = _ct_note(guitarpro.NoteType.normal, gp_string=1, fret=5)
+    note2 = _ct_note(guitarpro.NoteType.normal, gp_string=1, fret=7)
+    beat1 = _ct_beat(tick=0, dur_value=4, notes=[note1])
+    beat2 = _ct_beat(tick=GP_TICKS_PER_QUARTER, dur_value=4, notes=[note2])
+
+    xml_str = convert_track(_ct_song([beat1, beat2]), track_index=0)
+    root = ET.fromstring(xml_str)  # noqa: S314
+    notes = root.findall(".//notes/note")
+
+    assert len(notes) == 2
+    assert notes[0].get("fret") == "5"
+    assert notes[1].get("fret") == "7"
+
+
+# ── convert_piano_track: tied-note pitch-bucket collision ─────────────────────
+# MIDI notes 48 (C3) and 50 (D3) both map to rs_string=2. A chord containing
+# both, followed by ties for both, must extend each note individually — not
+# share a single rs_string=2 bucket that only tracks whichever was stored last.
+
+def _piano_song(beats):
+    """One-measure mock for convert_piano_track with two GP strings at MIDI 48 and 50."""
+    voice = SimpleNamespace(beats=beats)
+    measure = SimpleNamespace(voices=[voice])
+    strings = [
+        SimpleNamespace(number=1, value=48),  # C3 — encodes to rs_string=2, rs_fret=0
+        SimpleNamespace(number=2, value=50),  # D3 — encodes to rs_string=2, rs_fret=2
+    ]
+    track = SimpleNamespace(
+        strings=strings,
+        channel=SimpleNamespace(instrument=0),
+        measures=[measure],
+        name="Piano",
+    )
+    mh = SimpleNamespace(
+        start=0, number=1,
+        timeSignature=SimpleNamespace(numerator=4, denominator=SimpleNamespace(value=4)),
+        isRepeatOpen=False, repeatClose=-1, repeatAlternative=0,
+        direction=None, fromDirection=None, marker=None,
+    )
+    return SimpleNamespace(
+        title="Test", artist="Test", album="Test",
+        copyright=None, subtitle=None, tempo=120,
+        tracks=[track],
+        measureHeaders=[mh],
+    )
+
+
+def test_piano_tied_chord_both_notes_extended():
+    """Two simultaneous piano notes in the same rs_string bucket must each get
+    their own sustain extension — not share a single string-keyed slot."""
+    # Beat 1: chord of MIDI 48 (gp_str=1) and MIDI 50 (gp_str=2), both 0.5 s
+    n_c3 = _ct_note(guitarpro.NoteType.normal, gp_string=1, fret=0)
+    n_d3 = _ct_note(guitarpro.NoteType.normal, gp_string=2, fret=0)
+    beat1 = _ct_beat(tick=0, dur_value=4, notes=[n_c3, n_d3])
+
+    # Beat 2: ties for both — should extend each note to ~1.0 s
+    t_c3 = _ct_note(guitarpro.NoteType.tie, gp_string=1, fret=0)
+    t_d3 = _ct_note(guitarpro.NoteType.tie, gp_string=2, fret=0)
+    beat2 = _ct_beat(tick=GP_TICKS_PER_QUARTER, dur_value=4, notes=[t_c3, t_d3])
+
+    xml_str = convert_piano_track(_piano_song([beat1, beat2]), track_index=0)
+    root = ET.fromstring(xml_str)  # noqa: S314
+    chords = root.findall(".//chords/chord")
+
+    assert len(chords) == 1, "tie beat must not emit a second chord"
+    chord_notes = chords[0].findall("chordNote")
+    assert len(chord_notes) == 2
+
+    for cn in chord_notes:
+        sustain = float(cn.get("sustain"))
+        assert sustain == pytest.approx(1.0, abs=0.01), (
+            f"fret={cn.get('fret')} sustain={sustain:.3f}, expected ~1.0 s"
+        )
+
+
+# ── convert_track: tie must not cross a backward repeat boundary ──────────────
+# When the playback schedule loops backwards (repeat loopbacks, D.S., D.C.),
+# the tie-tracking state must be cleared so a tie note at the start of a
+# repeated section cannot accidentally extend the last note from the previous
+# pass.  Forward skips (volta alternatives, al-Coda redirects) are NOT cleared
+# because consecutive forward schedule entries are adjacent in the output audio.
+
+
+def _ct_song_repeat(beats_m0, beats_m1):
+    """Two-measure mock song where measure 0 is the repeat-open and measure 1
+    is the repeat-close (×1 extra repeat → plays twice total).
+
+    120 BPM, 4/4, standard 6-string guitar.
+    """
+    voice0 = SimpleNamespace(beats=beats_m0)
+    voice1 = SimpleNamespace(beats=beats_m1)
+    measure0 = SimpleNamespace(voices=[voice0])
+    measure1 = SimpleNamespace(voices=[voice1])
+    strings = [SimpleNamespace(number=i + 1, value=v)
+               for i, v in enumerate([64, 59, 55, 50, 45, 40])]
+    track = SimpleNamespace(
+        strings=strings,
+        channel=SimpleNamespace(instrument=24),
+        measures=[measure0, measure1],
+        name="Guitar",
+    )
+    # measure 0: repeat open, tick 0
+    mh0 = SimpleNamespace(
+        start=0,
+        number=1,
+        timeSignature=SimpleNamespace(
+            numerator=4, denominator=SimpleNamespace(value=4)
+        ),
+        isRepeatOpen=True,
+        repeatClose=-1,       # close is on mh1
+        repeatAlternative=0,
+        direction=None,
+        fromDirection=None,
+        marker=None,
+    )
+    # measure 1: repeat close, plays the bracket one extra time (total ×2)
+    mh1 = SimpleNamespace(
+        start=4 * GP_TICKS_PER_QUARTER,
+        number=2,
+        timeSignature=SimpleNamespace(
+            numerator=4, denominator=SimpleNamespace(value=4)
+        ),
+        isRepeatOpen=False,
+        repeatClose=1,        # repeat the bracket once more → 2 total passes
+        repeatAlternative=0,
+        direction=None,
+        fromDirection=None,
+        marker=None,
+    )
+    return SimpleNamespace(
+        title="Test",
+        artist="Test",
+        album="Test",
+        copyright=None,
+        subtitle=None,
+        tempo=120,
+        tracks=[track],
+        measureHeaders=[mh0, mh1],
+    )
+
+
+def test_tie_not_extended_across_repeat_boundary():
+    """A tie note at the start of a repeated section must be silently dropped on
+    the second pass — not extend the last note from the end of the first pass.
+
+    Schedule after repeat expansion:
+      mh=0 pass0 → mh=1 pass0 → mh=0 pass1 → mh=1 pass1
+
+    Measure 0 beat0 is a tie on string 1.  No previous note exists on pass0
+    (correctly dropped).  Measure 1 beat0 is a normal note on string 1.
+
+    Without the repeat-boundary clear, on pass1 the tie in mh=0 would
+    incorrectly extend measure 1's note from pass0.  With the clear it is
+    dropped (still no valid predecessor within this pass).
+    """
+    # measure 0: tie on string 1 (no predecessor on first pass → should drop)
+    tie_beat = _ct_beat(tick=0, dur_value=4,
+                        notes=[_ct_note(guitarpro.NoteType.tie, gp_string=1, fret=5)])
+    # measure 1: normal note on string 1
+    normal_beat = _ct_beat(tick=4 * GP_TICKS_PER_QUARTER, dur_value=4,
+                           notes=[_ct_note(guitarpro.NoteType.normal, gp_string=1, fret=5)])
+
+    xml_str = convert_track(_ct_song_repeat([tie_beat], [normal_beat]), track_index=0)
+    root = ET.fromstring(xml_str)  # noqa: S314
+    notes = root.findall(".//notes/note")
+
+    # Two passes through measure 1 → two normal notes; the ties are both dropped.
+    assert len(notes) == 2, (
+        f"repeat boundary must not allow tie to extend across passes; got {len(notes)} notes"
+    )
+    # Each note should have its authored sustain (~0.5 s for a quarter at 120 BPM),
+    # not an inflated value caused by an erroneous cross-boundary tie extension.
+    for n in notes:
+        sustain = float(n.get("sustain"))
+        # quarter note at 120 BPM = 0.5 s, which is > 0.2 threshold → sustain=0.5
+        assert sustain == pytest.approx(0.5, abs=0.01), (
+            f"sustain should be ~0.5 s (one quarter note), got {sustain:.3f}"
+        )

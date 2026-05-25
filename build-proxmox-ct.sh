@@ -13,9 +13,8 @@
 #   sudo bash build-proxmox-ct.sh arm64 slopsmith-ct
 #
 # Environment variables:
-#   ROCKSMITH_SRC_DIR   Path to Rocksmith2014 install root, containing both
-#                       dlc/*_p.psarc and songs.psarc (default: /mnt/z/Steam/...).
-#                       The legacy ROCKSMITH_SRC_DLC name is still accepted.
+#   SONG_SRC_DIR        Path to the song source root, containing both
+#                       dlc/*_p.psarc and songs.psarc (default: /mnt/z/songs).
 #   SKIP_HASH_CHECK=1   Bypass SHA256 verification — for unpinned hashes OR
 #                       to override mismatches when an upstream artifact rolls
 #                       (e.g. dot.net/v1/dotnet-install.sh). Use with caution.
@@ -102,10 +101,9 @@ VENV_DIR="/opt/app-venv"
 RSCLI_DIR="/opt/rscli"
 DLC_DIR="/dlc"
 CONFIG_DIR="/config"
-ROCKSMITH_DIR="/rocksmith"
-# Accept the legacy ROCKSMITH_SRC_DLC for backwards compatibility, but prefer
-# ROCKSMITH_SRC_DIR (the variable points at the install ROOT, not just dlc/).
-ROCKSMITH_SRC_DIR="${ROCKSMITH_SRC_DIR:-${ROCKSMITH_SRC_DLC:-/mnt/z/Steam/steamapps/common/Rocksmith2014}}"
+SONG_ARCHIVE_DIR="/songs"
+# SONG_SRC_DIR points at the source ROOT (the directory containing dlc/).
+SONG_SRC_DIR="${SONG_SRC_DIR:-/mnt/z/songs}"
 SVC_USER="slopsmith"
 
 # Coloured logging
@@ -387,7 +385,7 @@ ok "Python venv + dependencies installed."
 # 7. Data directories + assets
 # =============================================================================
 info "Populating data directories …"
-mkdir -p "${ROOTFS}${CONFIG_DIR}" "${ROOTFS}${DLC_DIR}" "${ROOTFS}${ROCKSMITH_DIR}"
+mkdir -p "${ROOTFS}${CONFIG_DIR}" "${ROOTFS}${DLC_DIR}" "${ROOTFS}${SONG_ARCHIVE_DIR}"
 
 if [[ -d "config" ]]; then
   cp -r config/. "${ROOTFS}${CONFIG_DIR}/"
@@ -396,15 +394,15 @@ else
   warn "  config/ not found."
 fi
 
-if compgen -G "${ROCKSMITH_SRC_DIR}/dlc/*_p.psarc" &>/dev/null; then
-  cp "${ROCKSMITH_SRC_DIR}"/dlc/*_p.psarc "${ROOTFS}${DLC_DIR}/"
+if compgen -G "${SONG_SRC_DIR}/dlc/*_p.psarc" &>/dev/null; then
+  cp "${SONG_SRC_DIR}"/dlc/*_p.psarc "${ROOTFS}${DLC_DIR}/"
   info "  Copied DLC psarc files."
 else
   warn "  No *_p.psarc files found – copy them into ${DLC_DIR} on Proxmox."
 fi
 
-if [[ -f "${ROCKSMITH_SRC_DIR}/songs.psarc" ]]; then
-  cp "${ROCKSMITH_SRC_DIR}/songs.psarc" "${ROOTFS}${ROCKSMITH_DIR}/"
+if [[ -f "${SONG_SRC_DIR}/songs.psarc" ]]; then
+  cp "${SONG_SRC_DIR}/songs.psarc" "${ROOTFS}${SONG_ARCHIVE_DIR}/"
   info "  Copied songs.psarc"
 else
   warn "  songs.psarc not found."
@@ -519,7 +517,7 @@ chown -hR "${SVC_UID}:${SVC_GID}" \
               "${ROOTFS}${APP_DIR}" "${ROOTFS}${CONFIG_DIR}" \
               "${ROOTFS}${DLC_DIR}" "${ROOTFS}${VENV_DIR}"
 chown -hR 0:0 "${ROOTFS}${RSCLI_DIR}" \
-              "${ROOTFS}${ROCKSMITH_DIR}"
+              "${ROOTFS}${SONG_ARCHIVE_DIR}"
 
 # (e) Fix resolv.conf to use the systemd-resolved stub. MUST run after the
 # last r() invocation: r() bind-mounts the host /etc/resolv.conf onto the

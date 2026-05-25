@@ -14,3 +14,4 @@ structlog>=24.1.0
 asgi-correlation-id>=4.3.3
 psutil>=5.9.0
 py-cpuinfo>=9.0.0
+yt-dlp>=2025.1.1

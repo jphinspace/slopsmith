@@ -623,8 +623,20 @@ def convert_track(
     rs_chords = []
     chord_templates: list[ChordTemplate] = []
     chord_template_map: dict[tuple, int] = {}  # fret tuple → index
+    last_note_per_string: dict[int, RsNote] = {}  # for tie sustain extension
+    _prev_mh_index: int = -1  # sentinel: no previous entry
 
     for entry in schedule:
+        # Clear the tie-tracking state on backward jumps in the playback
+        # schedule (repeat loopbacks, D.S., D.C.).  A tie at the start of
+        # a repeated section must not extend the last note from the previous
+        # pass through that section.  Forward skips (volta alternatives,
+        # al-Coda redirects) are *not* cleared because consecutive schedule
+        # entries that jump forward are still adjacent in the output audio,
+        # so a tie crossing such a boundary is semantically valid.
+        if _prev_mh_index != -1 and entry.mh_index <= _prev_mh_index:
+            last_note_per_string.clear()
+        _prev_mh_index = entry.mh_index
         measure = track.measures[entry.mh_index]
         for voice in measure.voices:
             for beat in voice.beats:
@@ -643,6 +655,13 @@ def convert_track(
                         continue
 
                     rs_str = _gp_string_to_rs(note.string, num_strings)
+
+                    if note.type == guitarpro.NoteType.tie:
+                        prev = last_note_per_string.get(rs_str)
+                        if prev is not None and prev.time < t:
+                            prev.sustain = max(prev.sustain, (t + dur) - prev.time)
+                        continue
+
                     fret = note.value
                     if note.type == guitarpro.NoteType.dead:
                         fret = max(fret, 0)
@@ -692,6 +711,9 @@ def convert_track(
                         rn.tremolo = True
 
                     beat_notes.append(rn)
+                    existing = last_note_per_string.get(rs_str)
+                    if existing is None or rn.time >= existing.time:
+                        last_note_per_string[rs_str] = rn
 
                 if not beat_notes:
                     continue
@@ -1163,8 +1185,20 @@ def convert_piano_track(
     rs_chords = []
     chord_templates: list[ChordTemplate] = []
     chord_template_map: dict[tuple, int] = {}
+    last_note_per_pitch: dict[tuple[int, int], RsNote] = {}  # (rs_string, rs_fret) → note, for tie sustain extension
+    _prev_mh_index: int = -1  # sentinel: no previous entry
 
     for entry in schedule:
+        # Clear the tie-tracking state on backward jumps in the playback
+        # schedule (repeat loopbacks, D.S., D.C.).  A tie at the start of
+        # a repeated section must not extend the last note from the previous
+        # pass through that section.  Forward skips (volta alternatives,
+        # al-Coda redirects) are *not* cleared because consecutive schedule
+        # entries that jump forward are still adjacent in the output audio,
+        # so a tie crossing such a boundary is semantically valid.
+        if _prev_mh_index != -1 and entry.mh_index <= _prev_mh_index:
+            last_note_per_pitch.clear()
+        _prev_mh_index = entry.mh_index
         measure = track.measures[entry.mh_index]
         for voice in measure.voices:
             for beat in voice.beats:
@@ -1186,7 +1220,7 @@ def convert_piano_track(
                     # In GP, note.value is the fret, and the string tuning
                     # gives the base MIDI value
                     gp_str_idx = note.string  # 1-based in GP
-                    if gp_str_idx <= len(track.strings):
+                    if 1 <= gp_str_idx <= len(track.strings):
                         base_midi = track.strings[gp_str_idx - 1].value
                     else:
                         base_midi = 60  # fallback to middle C
@@ -1195,6 +1229,12 @@ def convert_piano_track(
                     # Encode into Rocksmith string+fret
                     rs_string = midi_note // 24
                     rs_fret = midi_note % 24
+
+                    if note.type == guitarpro.NoteType.tie:
+                        prev = last_note_per_pitch.get((rs_string, rs_fret))
+                        if prev is not None and prev.time < t:
+                            prev.sustain = max(prev.sustain, (t + dur) - prev.time)
+                        continue
 
                     rn = RsNote(
                         time=t,
@@ -1210,6 +1250,10 @@ def convert_piano_track(
                         rn.accent = True
 
                     beat_notes.append(rn)
+                    pitch_key = (rs_string, rs_fret)
+                    existing = last_note_per_pitch.get(pitch_key)
+                    if existing is None or rn.time >= existing.time:
+                        last_note_per_pitch[pitch_key] = rn
 
                 if not beat_notes:
                     continue
@@ -1367,7 +1411,7 @@ def convert_drum_track(
                     # string tuning value (each "string" = a drum piece).
                     # note.value is the fret (usually 0 for drums).
                     gp_str_idx = note.string  # 1-based
-                    if gp_str_idx <= len(track.strings):
+                    if 1 <= gp_str_idx <= len(track.strings):
                         midi_note = track.strings[gp_str_idx - 1].value + note.value
                     else:
                         midi_note = note.value
@@ -1459,6 +1503,153 @@ def convert_drum_track(
         anchors=anchors,
         tempo=song.tempo,
     )
+
+
+def convert_drum_track_to_drumtab(
+    song: guitarpro.Song,
+    track_index: int,
+    audio_offset: float = 0.0,
+    arrangement_name: str = "Drums",
+    *,
+    expand_repeats: bool = True,
+    out_unmapped: dict[int, dict] | None = None,
+) -> dict:
+    """Convert a GP drum/percussion track to a `drum_tab.json` dict.
+
+    Returns the payload documented in `docs/sloppak-spec.md` §5.3:
+
+        {"version": 1, "name": str,
+         "kit": [{"id": piece, "name": label}, ...],
+         "hits": [{"t": float, "p": piece, "v": int, "g"?: bool,
+                   "f"?: bool, "k"?: float}, ...]}
+
+    Velocity is preserved verbatim (pyguitarpro uses MIDI 1-127). Ghost notes
+    are surfaced as `g: true` (not as a velocity penalty), flams as `f: true`
+    via `NoteEffect.isGrace`. Hi-hat openness is derived from the MIDI note
+    number (42 closed / 46 open / 44 pedal) since GP stores those on distinct
+    drum strings. Unknown percussion sounds (cowbell, tambourine etc.) are
+    skipped — round-tripping them would require teaching `lib/drums.py` first.
+    Callers can pass an empty dict as ``out_unmapped`` to receive a per-MIDI
+    record of every skipped note (``{midi: {"count": int, "times": [...]}}``,
+    times capped at 100 samples per note) so they can surface a warning or
+    offer a manual mapping UI.
+
+    Honours GP repeat brackets and D.S./D.C./Coda/Fine jumps when
+    ``expand_repeats`` is true — same `_build_playback_schedule` machinery
+    used by the guitar/bass/keys/legacy-drum-XML converters above.
+    """
+    # Imported lazily so an environment without lib/drums.py (older worktree
+    # checkout) still loads gp2rs successfully.
+    import drums as drums_mod
+
+    track = song.tracks[track_index]
+    tempo_map = _build_tempo_map(song)
+    schedule = _build_playback_schedule(song, tempo_map, expand_repeats)
+
+    hits: list[dict] = []
+    pieces_seen: dict[str, str] = {}  # piece-id → display name
+
+    for entry in schedule:
+        measure = track.measures[entry.mh_index]
+        for voice in measure.voices:
+            for beat in voice.beats:
+                if not beat.notes:
+                    continue
+
+                authored_beat_secs = _tick_to_seconds(beat.start, tempo_map)
+                t = (
+                    (authored_beat_secs - entry.mh_authored_start_secs)
+                    + entry.output_start_secs
+                    + audio_offset
+                )
+
+                for note in beat.notes:
+                    if note.type == guitarpro.NoteType.rest:
+                        continue
+
+                    # Percussion tracks: MIDI note is the string's tuning
+                    # value (each "string" pins a drum piece) + fret offset.
+                    gp_str_idx = note.string
+                    if 1 <= gp_str_idx <= len(track.strings):
+                        midi_note = track.strings[gp_str_idx - 1].value + note.value
+                    else:
+                        midi_note = note.value
+
+                    piece = drums_mod.midi_to_piece(midi_note)
+                    if piece is None:
+                        # Unmapped percussion sound. Record it for the
+                        # optional out-parameter so the caller can surface
+                        # a "these notes were dropped" warning to the user
+                        # (with the option to map them by hand). The
+                        # default path is still to skip silently for
+                        # backward compatibility with callers that don't
+                        # opt in.
+                        if out_unmapped is not None:
+                            # NB: do NOT shadow the outer `entry` loop
+                            # variable from `for entry in schedule:`.
+                            unmapped_rec = out_unmapped.setdefault(
+                                int(midi_note), {"count": 0, "times": []})
+                            unmapped_rec["count"] += 1
+                            if len(unmapped_rec["times"]) < 100:
+                                unmapped_rec["times"].append(round(t, 3))
+                        continue
+
+                    hit: dict = {"t": round(t, 3), "p": piece}
+
+                    # Velocity: GP stores 1-127 MIDI velocity directly; default
+                    # is 95 (Velocities.default). Pass through verbatim,
+                    # clamping defensively so a corrupt file can't poison the
+                    # wire format.
+                    vel = int(getattr(note, "velocity", 0) or 0)
+                    if 1 <= vel <= 127:
+                        hit["v"] = vel
+
+                    eff = note.effect
+                    # Ghost — explicit flag on the GP effect. Accent flag is
+                    # already reflected in the higher velocity, so we don't
+                    # need a separate `ac` field on the hit.
+                    if getattr(eff, "ghostNote", False):
+                        hit["g"] = True
+                    # Flam / grace note — pyguitarpro models grace notes as a
+                    # GraceEffect dangling off NoteEffect; `isGrace` is the
+                    # convenience boolean. Drum charts use grace almost
+                    # exclusively for flams, so map directly.
+                    if getattr(eff, "isGrace", False):
+                        hit["f"] = True
+
+                    # Cymbal choke — GP doesn't have a first-class field for
+                    # it, but staccato on a cymbal piece is the closest
+                    # idiomatic encoding. Treat it as a short choke tail
+                    # (~80 ms) so the highway can render the fade-out.
+                    if (
+                        drums_mod.piece_category(piece) == "cymbal"
+                        and getattr(eff, "staccato", False)
+                    ):
+                        hit["k"] = 0.08
+
+                    hits.append(hit)
+
+                    if piece not in pieces_seen:
+                        # Title-case piece-id for the kit legend name; user-
+                        # facing labels are overridden at the lane-config
+                        # level anyway.
+                        pieces_seen[piece] = piece.replace("_", " ").title()
+
+    hits.sort(key=lambda h: h["t"])
+
+    # Times for unmapped notes were collected in beat-iteration order;
+    # multi-voice measures can produce out-of-order beats, so sort each
+    # entry's `times` list chronologically before returning to the caller.
+    if out_unmapped is not None:
+        for _rec in out_unmapped.values():
+            _rec["times"].sort()
+
+    return {
+        "version": drums_mod.SCHEMA_VERSION,
+        "name": arrangement_name,
+        "kit": [{"id": pid, "name": name} for pid, name in pieces_seen.items()],
+        "hits": hits,
+    }
 
 
 def convert_file(

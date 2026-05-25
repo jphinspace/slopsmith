@@ -619,7 +619,7 @@ def load_plugins(app: FastAPI, context: dict, progress_cb=None, route_setup_fn=N
             if not manifest_path.exists():
                 continue
             try:
-                manifest = json.loads(manifest_path.read_text())
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             except Exception as e:
                 log.warning("Failed to read plugin manifest %s: %s", manifest_path, e)
                 continue
@@ -1337,7 +1337,7 @@ def register_plugin_api(app: FastAPI):
                 settings = p["_manifest"].get("settings", {})
                 settings_file = p["_dir"] / (settings.get("html", "settings.html") if isinstance(settings, dict) else "settings.html")
                 if settings_file.exists():
-                    return HTMLResponse(settings_file.read_text())
+                    return HTMLResponse(settings_file.read_text(encoding="utf-8"))
         return HTMLResponse("", status_code=404)
 
     @app.get("/api/plugins/{plugin_id}/tour.json")

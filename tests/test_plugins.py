@@ -18,6 +18,7 @@ import importlib
 import json
 import logging
 import sys
+from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
@@ -2782,3 +2783,73 @@ def test_install_requirements_marker_is_stable_across_calls(tmp_path, reset_plug
         "marker must contain a deterministic digest of requirements.txt; "
         f"got {first_marker_contents!r}, expected {expected!r}"
     )
+
+
+# ── settings.html encoding ─────────────────────────────────────────────────────
+
+def test_settings_html_served_as_utf8_regardless_of_host_locale(
+    tmp_path, reset_plugin_state, monkeypatch
+):
+    """Regression for slopsmith-desktop#166 — mojibake in the Settings UI.
+
+    The ``settings.html`` plugin endpoint must read its file with an
+    explicit ``encoding="utf-8"``.  Without it, ``Path.read_text()`` falls
+    back to the host's locale encoding — cp1252 on a Windows host — which
+    decodes UTF-8 punctuation (em-dash ``—``, arrow ``→``) into mojibake
+    (``â€``, ``â†``).  Its sibling endpoints ``screen.html`` / ``screen.js``
+    already pass ``encoding="utf-8"``; ``settings.html`` was the lone
+    outlier.  This test simulates the Windows locale default so the bug is
+    caught even on a UTF-8 CI host.
+    """
+    plugins = reset_plugin_state
+
+    plugin_dir = tmp_path / "fx"
+    plugin_dir.mkdir()
+    settings_html = (
+        "<p>Audio Quality (Guitar → audio rendering)</p>"
+        "<p>Default — GeneralUser GS (~32 MB, bundled)</p>"
+    )
+    # The on-disk file is genuine, correct UTF-8 — the strings are not the bug.
+    (plugin_dir / "settings.html").write_text(settings_html, encoding="utf-8")
+    (plugin_dir / "plugin.json").write_text(
+        json.dumps({"id": "fx", "name": "FX", "settings": {"html": "settings.html"}})
+    )
+
+    plugins.LOADED_PLUGINS.append({
+        "id": "fx",
+        "name": "FX",
+        "nav": None,
+        "type": None,
+        "has_screen": False,
+        "has_script": False,
+        "has_settings": True,
+        "has_tour": False,
+        "_dir": plugin_dir,
+        "_manifest": {"settings": {"html": "settings.html"}},
+    })
+
+    # Simulate a Windows host: a ``read_text()`` call with no explicit
+    # encoding falls back to the cp1252 locale default. An explicit
+    # encoding (the fix) is honoured unchanged.
+    real_read_text = Path.read_text
+
+    def cp1252_default_read_text(self, encoding=None, *args, **kwargs):
+        if encoding is None:
+            return self.read_bytes().decode("cp1252")
+        return real_read_text(self, encoding, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", cp1252_default_read_text)
+
+    client = _make_api_client(plugins)
+    try:
+        r = client.get("/api/plugins/fx/settings.html")
+        assert r.status_code == 200
+        # The served body must byte-for-byte match the on-disk UTF-8 file.
+        assert r.content == settings_html.encode("utf-8")
+        # And must contain the real characters, not their mojibake forms.
+        assert "Guitar → audio rendering" in r.text
+        assert "Default — GeneralUser GS" in r.text
+        assert "â€" not in r.text  # 'â€' — em-dash decoded as cp1252
+        assert "â†" not in r.text  # 'â†' — arrow decoded as cp1252
+    finally:
+        client.close()

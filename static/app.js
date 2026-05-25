@@ -112,13 +112,13 @@ function _libNavItems() {
         // the currently-displayed nodes so collapsed children don't
         // count as targets the keyboard can land on.
         const all = Array.from(tree.querySelectorAll(
-            '.artist-header, .album-header, .song-row[data-play]'
+            '.artist-header, .album-header, .song-row[data-play], .song-row[data-library-song][tabindex="0"]'
         ));
         items = all.filter(_isElementVisible);
         container = tree;
         mode = 'list';
     } else {
-        items = Array.from((grid || document).querySelectorAll('.song-card[data-play]'));
+        items = Array.from((grid || document).querySelectorAll('.song-card[data-play], .song-card[data-library-song][tabindex="0"]'));
         container = grid;
         mode = 'grid';
     }
@@ -188,18 +188,32 @@ function _selectedKeyForActiveScreen() {
     return null;
 }
 function _persistLibSelection(el) {
-    if (!el || !el.dataset || !el.dataset.play) return;
+    if (!el || !el.dataset) return;
+    // Both local entries (data-play) and remote entries (data-library-song,
+    // no data-play yet) are persisted so the selection highlight survives a
+    // library re-render after sync or provider switch.
+    const isLocal = !!el.dataset.play;
+    const isRemote = !isLocal && !!el.dataset.librarySong;
+    if (!isLocal && !isRemote) return;
     const key = _selectedKeyForActiveScreen();
     if (!key) return;
-    // Stored as JSON `{f, a}` — `f` (filename) drives the
-    // restore-by-attribute lookup; `a` (artist) is recorded for
-    // future use (e.g. cross-page restore that needs to fetch the
-    // saved artist's letter bucket) but currently unread. The bare-
-    // string filename format older builds wrote is still tolerated
-    // in `_loadPersistedLibSelection`.
+    // Stored as JSON `{f, a, p, s}`:
+    //   f — encoded filename (local entries); drives data-play restore.
+    //   a — artist, for future cross-page restore.
+    //   p — encoded provider id; prevents cross-provider collisions.
+    //   s — encoded song id (remote entries); drives data-library-song restore.
+    // Older bare-string and {f,a}/{f,a,p} formats are still tolerated in
+    // `_loadPersistedLibSelection`.
     const artist = el.dataset.artist || '';
+    const provider = el.dataset.libraryProvider || '';
+    // For synced provider entries (data-play + data-library-song both present),
+    // persist both f and s so _restoreLibSelection can match the card by either
+    // attribute after a post-sync re-render.
+    const payload = isLocal
+        ? { f: el.dataset.play, a: artist, p: provider, s: el.dataset.librarySong || '' }
+        : { f: '', a: artist, p: provider, s: el.dataset.librarySong };
     try {
-        localStorage.setItem(key, JSON.stringify({ f: el.dataset.play, a: artist }));
+        localStorage.setItem(key, JSON.stringify(payload));
     } catch { /* private mode / quota */ }
 }
 
@@ -210,10 +224,10 @@ function _loadPersistedLibSelection(key) {
     // Tolerate the older bare-string format (just the encoded
     // filename) — older builds wrote that and we'd rather upgrade
     // silently than orphan the user's saved selection.
-    if (raw[0] !== '{') return { f: raw, a: '' };
+    if (raw[0] !== '{') return { f: raw, a: '', p: '', s: '' };
     try {
         const o = JSON.parse(raw);
-        return (o && typeof o === 'object') ? { f: o.f || '', a: o.a || '' } : null;
+        return (o && typeof o === 'object') ? { f: o.f || '', a: o.a || '', p: o.p || '', s: o.s || '' } : null;
     } catch { return null; }
 }
 
@@ -272,13 +286,35 @@ function _restoreLibSelection(scopeEl, screen, { scroll = true } = {}) {
     if (!scopeEl) return null;
     const key = screen === 'favorites' ? _FAV_SELECTED_KEY : _LIB_SELECTED_KEY;
     const saved = _loadPersistedLibSelection(key);
-    if (!saved || !saved.f) return null;
-    // Match `data-play` exactly — both are the encoded form, so no
-    // decoding needed. Avoid interpolating persisted data into a CSS
-    // selector so malformed localStorage cannot make querySelector
-    // throw and break rendering.
-    const candidates = scopeEl.querySelectorAll('.song-card[data-play], .song-row[data-play]');
-    const el = Array.from(candidates).find((node) => node.dataset.play === saved.f);
+    if (!saved || (!saved.f && !saved.s)) return null;
+    // Match by dataset values — both stored and DOM values are in the
+    // encoded form, so no decoding is needed. Avoid interpolating persisted
+    // data into CSS selectors so malformed localStorage can't make
+    // querySelector throw and break rendering.
+    //
+    // Local entries: match data-play (f) + data-library-provider (p) when p
+    // is present to avoid cross-provider collisions on the same filename.
+    // Remote entries: match data-library-song (s) + data-library-provider (p).
+    // When f is present but no data-play card matches (e.g. the file has not
+    // been downloaded on this load), fall back to the s (provider song-id) so
+    // a previously-synced remote selection can still be restored.
+    let el = null;
+    if (saved.f) {
+        const candidates = scopeEl.querySelectorAll('.song-card[data-play], .song-row[data-play]');
+        el = Array.from(candidates).find((node) => {
+            if (node.dataset.play !== saved.f) return false;
+            if (saved.p && node.dataset.libraryProvider !== saved.p) return false;
+            return true;
+        });
+    }
+    if (!el && saved.s) {
+        const candidates = scopeEl.querySelectorAll('.song-card[data-library-song], .song-row[data-library-song]');
+        el = Array.from(candidates).find((node) => {
+            if (node.dataset.librarySong !== saved.s) return false;
+            if (saved.p && node.dataset.libraryProvider !== saved.p) return false;
+            return true;
+        });
+    }
     if (!el) return null;
     // Open every collapsed ancestor in the tree so the restored row
     // is on-screen; harmless on the grid since cards have no such
@@ -378,6 +414,16 @@ function _handleLibArrowNav(e) {
         _setLibSelection(currentTarget, { focus: false });
         if (currentTarget.classList.contains('song-row') ||
             currentTarget.classList.contains('song-card')) {
+            if (currentTarget.dataset.librarySong && !currentTarget.dataset.play) {
+                const providerId = decodeURIComponent(currentTarget.dataset.libraryProvider || '');
+                if (!_providerSupports(providerId, 'song.sync')) return true;
+                syncLibrarySong(
+                    providerId,
+                    decodeURIComponent(currentTarget.dataset.librarySong || ''),
+                    { playWhenReady: true },
+                );
+                return true;
+            }
             // Song row OR card → play it. Pass `dataset.play` raw to
             // match the click delegate; `playSong` handles decoding
             // internally so decoding here would double-decode and
@@ -874,7 +920,20 @@ async function showScreen(id) {
     // generation so the next keypress doesn't reuse a cache built
     // against a now-hidden screen's container.
     _bumpLibNavGeneration();
-    if (id === 'home') { _libScrollOnNextRender.home = true; loadLibrary(); }
+    if (id === 'home') {
+        _libScrollOnNextRender.home = true;
+        const beforeProviderId = _activeLibraryProviderId();
+        await loadLibraryProviders({ restoreSaved: true });
+        if (_activeLibraryProviderId() !== beforeProviderId) {
+            _resetLibraryProviderViewState();
+        } else {
+            _libEpoch++;
+            currentPage = 0;
+            _treeStats = null;
+            stopInfiniteScroll();
+        }
+        loadLibrary(0);
+    }
     if (id === 'favorites') { _libScrollOnNextRender.favorites = true; loadFavorites(); }
     if (id === 'settings') {
         // Record where we came from so Esc can go back. The player screen
@@ -937,6 +996,7 @@ async function showScreen(id) {
 const _LIB_VIEW_KEY = 'slopsmith.libView';
 const _LIB_SORT_KEY = 'slopsmith.libSort';
 const _LIB_FORMAT_KEY = 'slopsmith.libFormat';
+const _LIB_PROVIDER_KEY = 'slopsmith.libProvider';
 const _LIB_VIEW_VALUES = new Set(['grid', 'tree']);
 const _LIB_SORT_VALUES = new Set([
     'artist', 'artist-desc', 'title', 'title-desc',
@@ -966,6 +1026,216 @@ function _readPersistedChoice(key, allowed, fallback) {
 }
 function _writePersistedChoice(key, value) {
     try { localStorage.setItem(key, value); } catch { /* private mode / quota */ }
+}
+
+function _readPersistedLibraryProvider() {
+    try {
+        const providerId = localStorage.getItem(_LIB_PROVIDER_KEY);
+        return providerId || 'local';
+    } catch {
+        return 'local';
+    }
+}
+
+const _LOCAL_LIBRARY_PROVIDER = {
+    id: 'local',
+    label: 'My Library',
+    kind: 'local',
+    capabilities: ['library.read', 'art.read', 'song.play'],
+    default: true,
+};
+
+let _libraryProviders = [{ ..._LOCAL_LIBRARY_PROVIDER }];
+let _selectedLibraryProviderId = _readPersistedLibraryProvider();
+
+function _providerById(providerId) {
+    return _libraryProviders.find(provider => provider.id === providerId) || null;
+}
+
+function _activeLibraryProvider() {
+    return _providerById(_selectedLibraryProviderId) || _providerById('local') || _libraryProviders[0];
+}
+
+function _activeLibraryProviderId() {
+    return (_activeLibraryProvider() || {}).id || 'local';
+}
+
+function _isLocalLibraryProvider(providerId) {
+    const provider = _providerById(providerId);
+    return providerId === 'local' || (provider && provider.kind === 'local');
+}
+
+function _providerSupports(providerId, capability) {
+    const provider = _providerById(providerId);
+    return !!provider && Array.isArray(provider.capabilities) && provider.capabilities.includes(capability);
+}
+
+function _isBrowsableLibraryProvider(provider) {
+    return !!provider && Array.isArray(provider.capabilities) && provider.capabilities.includes('library.read');
+}
+
+function _applyLibraryProviderToParams(params) {
+    params.set('provider', _activeLibraryProviderId());
+    return params;
+}
+
+function _resetLibraryProviderViewState() {
+    _libEpoch++;
+    currentPage = 0;
+    _treePage = 0;
+    _treeStats = null;
+    _tuningNames = null;
+    stopInfiniteScroll();
+}
+
+function _renderLibraryProviderSelector() {
+    const select = document.getElementById('lib-provider');
+    const title = document.getElementById('lib-title');
+    const activeProvider = _activeLibraryProvider();
+    if (select) {
+        select.innerHTML = _libraryProviders.map(provider =>
+            `<option value="${_escAttr(provider.id)}">${esc(provider.label || provider.id)}</option>`
+        ).join('');
+        select.value = activeProvider.id;
+        select.classList.toggle('hidden', _libraryProviders.length <= 1);
+    }
+    if (title) title.textContent = activeProvider.id === 'local' ? 'Your Library' : (activeProvider.label || activeProvider.id);
+}
+
+async function loadLibraryProviders({ restoreSaved = false, reloadOnChange = false } = {}) {
+    const beforeProviderId = _activeLibraryProviderId();
+    try {
+        const response = await fetch('/api/library/providers');
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        const providers = (Array.isArray(data.providers) ? data.providers : []).filter(_isBrowsableLibraryProvider);
+        const hasLocal = providers.some(provider => provider && provider.id === 'local');
+        _libraryProviders = hasLocal
+            ? providers
+            : [{ ..._LOCAL_LIBRARY_PROVIDER }, ...providers.filter(provider => provider && provider.id !== 'local')];
+    } catch (error) {
+        console.warn('Failed to load library providers:', error);
+        _libraryProviders = [{ ..._LOCAL_LIBRARY_PROVIDER }];
+    }
+
+    const savedProviderId = restoreSaved ? _readPersistedLibraryProvider() : _selectedLibraryProviderId;
+    const hasSavedProvider = !!_providerById(savedProviderId);
+    const hasSelectedProvider = !!_providerById(_selectedLibraryProviderId);
+    if (hasSavedProvider) {
+        _selectedLibraryProviderId = savedProviderId;
+    } else if (!hasSelectedProvider) {
+        // The saved/selected provider is not in the current list — it may not have been
+        // registered yet (e.g. plugins haven't loaded on first call). Fall back to local
+        // in-memory but do NOT overwrite localStorage: a second call after plugins load
+        // will restore the correct selection from the persisted value.
+        _selectedLibraryProviderId = 'local';
+    }
+
+    _renderLibraryProviderSelector();
+    const afterProviderId = _activeLibraryProviderId();
+    if (reloadOnChange && afterProviderId !== beforeProviderId) {
+        _resetLibraryProviderViewState();
+        loadLibrary(0);
+    }
+}
+
+function setLibraryProvider(providerId) {
+    if (!_providerById(providerId)) return;
+    if (_selectedLibraryProviderId === providerId) return;
+    _selectedLibraryProviderId = providerId;
+    _writePersistedChoice(_LIB_PROVIDER_KEY, providerId);
+    _renderLibraryProviderSelector();
+    _resetLibraryProviderViewState();
+    loadLibrary(0);
+}
+
+function _libraryProviderIdForSong(song, fallbackProviderId) {
+    return String(
+        song.provider_id || song.providerId || song.library_provider_id ||
+        song.libraryProviderId || song.provider || fallbackProviderId || 'local'
+    );
+}
+
+function _librarySongId(song) {
+    const songId = song.song_id || song.songId || song.remote_id || song.remoteId || song.id || song.filename || '';
+    return String(songId || '');
+}
+
+function _libraryLocalFilename(song, providerId) {
+    if (_isLocalLibraryProvider(providerId)) return song.filename ? String(song.filename) : '';
+    const filename = song.local_filename || song.localFilename || song.synced_filename ||
+        song.syncedFilename || song.play_filename || song.playFilename || '';
+    if (filename) return String(filename);
+    const state = _librarySyncState(providerId, _librarySongId(song));
+    return state && state.status === 'synced' && state.localFilename ? String(state.localFilename) : '';
+}
+
+function _libraryDisplayFilename(song, providerId) {
+    return _libraryLocalFilename(song, providerId) || _librarySongId(song) || 'Unknown song';
+}
+
+function _librarySongTitle(song, providerId) {
+    const fallback = _libraryDisplayFilename(song, providerId);
+    return song.title || fallback.replace(/_p\.psarc$/i, '').replace(/_/g, ' ');
+}
+
+function _librarySongArtUrl(song, providerId) {
+    const explicitArt = song.art_url || song.artUrl || song.cover_url || song.coverUrl;
+    if (explicitArt) return _safeImageUrl(explicitArt);
+    const version = song.mtime ? `?v=${Math.floor(song.mtime)}` : '';
+    const localFilename = _libraryLocalFilename(song, providerId);
+    if (localFilename) return `/api/song/${encodeURIComponent(localFilename)}/art${version}`;
+    if (_isLocalLibraryProvider(providerId)) return '';
+    if (!_providerSupports(providerId, 'art.read')) return '';
+    const songId = _librarySongId(song);
+    return songId ? `/api/library/providers/${encodeURIComponent(providerId)}/songs/${encodeURIComponent(songId)}/art${version}` : '';
+}
+
+function _safeImageUrl(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+    try {
+        const parsed = new URL(raw, window.location.origin);
+        return ['http:', 'https:'].includes(parsed.protocol) ? parsed.href : '';
+    } catch {
+        return '';
+    }
+}
+
+const _librarySyncStates = new Map();
+
+function _librarySyncKey(providerId, songId) {
+    // JSON.stringify avoids delimiter collision: a newline in either value
+    // would make "${p}\n${s}" ambiguous, but JSON-serialised arrays are
+    // always distinct for distinct (providerId, songId) pairs.
+    return JSON.stringify([providerId, songId]);
+}
+
+function _librarySyncState(providerId, songId) {
+    return _librarySyncStates.get(_librarySyncKey(providerId, songId)) || null;
+}
+
+function _librarySyncStatusText(state) {
+    if (!state) return '';
+    if (state.status === 'syncing') return 'Loading package...';
+    if (state.status === 'synced') return state.message || 'Ready to play';
+    if (state.status === 'error') return state.message ? `Load failed: ${state.message}` : 'Load failed';
+    return '';
+}
+
+function _librarySyncStatusClass(state, layout) {
+    const base = layout === 'inline'
+        ? 'library-sync-status inline-block text-[11px] ml-1'
+        : 'library-sync-status block mt-1 text-[11px] leading-snug';
+    if (!state) return `${base} hidden text-gray-500`;
+    if (state.status === 'error') return `${base} text-red-300`;
+    if (state.status === 'synced') return `${base} text-green-300`;
+    return `${base} text-gray-400`;
+}
+
+function _librarySyncStatusMarkup(providerId, songId, layout = 'block') {
+    const state = _librarySyncState(providerId, songId);
+    return `<span data-library-sync-status role="status" aria-live="polite" data-library-sync-provider="${encodeURIComponent(providerId)}" data-library-sync-song="${encodeURIComponent(songId)}" class="${_librarySyncStatusClass(state, layout)}">${esc(_librarySyncStatusText(state))}</span>`;
 }
 
 let libView = _readPersistedChoice(_LIB_VIEW_KEY, _LIB_VIEW_VALUES, 'grid');
@@ -1165,13 +1435,19 @@ async function _renderTuningList() {
     if (!c) return;
     let fetchError = null;
     if (!_tuningNames) {
+        const myEpoch = _libEpoch;
         c.innerHTML = '<div class="text-xs text-gray-500 px-2">Loading...</div>';
         try {
-            const resp = await fetch('/api/library/tuning-names');
+            const params = _applyLibraryProviderToParams(new URLSearchParams());
+            const resp = await fetch(`/api/library/tuning-names?${params}`);
             if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
             const data = await resp.json();
+            // Guard against a provider switch that invalidated _tuningNames
+            // while this request was in flight — discard a stale result.
+            if (myEpoch !== _libEpoch) return;
             _tuningNames = Array.isArray(data.tunings) ? data.tunings : [];
         } catch (e) {
+            if (myEpoch !== _libEpoch) return;
             // Distinguish a server / network failure from "the DB
             // genuinely has no tunings indexed". The latter wants a
             // Full Rescan; the former just wants a retry. Don't cache
@@ -1346,6 +1622,52 @@ async function loadLibrary(page) {
     }
 }
 
+async function _fetchJsonOrThrow(url) {
+    const resp = await fetch(url);
+    const raw = await resp.text();
+    let data = {};
+    let parseError = null;
+    if (raw) {
+        try {
+            data = JSON.parse(raw);
+        } catch (error) {
+            parseError = error;
+        }
+    }
+    if (!resp.ok) {
+        const detail = String(data.detail || data.error || data.message || '').trim();
+        throw new Error(detail || `HTTP ${resp.status}`);
+    }
+    if (parseError) throw new Error('Malformed JSON response');
+    return data;
+}
+
+function _setLibraryOfflineMessage(containerId, countId, message) {
+    const container = document.getElementById(containerId);
+    const count = document.getElementById(countId);
+    if (count) count.textContent = 'Source appears offline';
+    if (container) {
+        container.innerHTML = `<div class="rounded-xl border border-red-900/30 bg-red-900/10 px-4 py-6 text-sm text-red-300">${esc(message || 'This source appears to be offline.')}</div>`;
+    }
+}
+
+function _setLibraryLoadingMessage(containerId, countId, message) {
+    const container = document.getElementById(containerId);
+    const count = document.getElementById(countId);
+    if (count) count.textContent = 'Loading source...';
+    if (container) {
+        container.innerHTML = `<div class="rounded-xl border border-gray-800/50 bg-dark-700/30 px-4 py-6 text-sm text-gray-300">${esc(message || 'Loading library...')}</div>`;
+    }
+}
+
+function _libraryLoadingText() {
+    const provider = _activeLibraryProvider();
+    if (!provider || provider.id === 'local' || provider.kind === 'local') {
+        return 'Loading library...';
+    }
+    return `Connecting to ${provider.label || provider.id}...`;
+}
+
 function filterLibrary() {
     clearTimeout(_debounceTimer);
     _debounceTimer = setTimeout(() => {
@@ -1391,16 +1713,30 @@ async function loadGridPage(page = 0) {
     const format = (document.getElementById('lib-format') || {}).value || '';
     const params = new URLSearchParams({ q, page, size: PAGE_SIZE, sort });
     if (format) params.set('format', format);
+    _applyLibraryProviderToParams(params);
     _applyLibFiltersToParams(params);
-    const resp = await fetch(`/api/library?${params}`);
-    const data = await resp.json();
+    if (page === 0) {
+        _setLibraryLoadingMessage('lib-grid', 'lib-count', _libraryLoadingText());
+    }
+    let data;
+    try {
+        data = await _fetchJsonOrThrow(`/api/library?${params}`);
+    } catch (error) {
+        if (myEpoch !== _libEpoch) return;
+        currentPage = 0;
+        _hasMore = false;
+        stopInfiniteScroll();
+        _setLibraryOfflineMessage('lib-grid', 'lib-count', error.message || 'This source appears to be offline.');
+        return;
+    }
     if (myEpoch !== _libEpoch) return; // filter/sort/view changed mid-fetch
 
     currentPage = page;
     const total = data.total || 0;
+    const songs = data.songs || [];
     document.getElementById('lib-count').textContent = `${total} songs`;
 
-    renderGridCards(data.songs || [], 'lib-grid', page === 0 ? 'replace' : 'append');
+    renderGridCards(songs, 'lib-grid', page === 0 ? 'replace' : 'append');
 
     _hasMore = (page + 1) * PAGE_SIZE < total;
     setupInfiniteScroll();
@@ -1461,26 +1797,53 @@ function formatBadgeInline(fmt, stemCount) {
 
 function renderGridCards(songs, containerId = 'lib-grid', mode = 'replace') {
     const grid = document.getElementById(containerId);
-    const html = songs.map(s => {
-        const title = s.title || s.filename.replace(/_p\.psarc$/i, '').replace(/_/g, ' ');
-        const artist = s.artist || '';
-        const duration = s.duration ? formatTime(s.duration) : '';
-        const tuning = s.tuning || '';
-        const artUrl = `/api/song/${encodeURIComponent(s.filename)}/art${s.mtime ? `?v=${Math.floor(s.mtime)}` : ''}`;
-        const isSloppak = s.format === 'sloppak';
-        const stdRetune = !isSloppak && tuning && !s.has_estd &&
+    const screenProviderId = containerId.startsWith('fav') ? 'local' : _activeLibraryProviderId();
+    const html = songs.map(song => {
+        const providerId = _libraryProviderIdForSong(song, screenProviderId);
+        const localFilename = _libraryLocalFilename(song, providerId);
+        const songId = _librarySongId(song);
+        const title = _librarySongTitle(song, providerId);
+        const artist = song.artist || '';
+        const duration = song.duration ? formatTime(song.duration) : '';
+        const tuning = song.tuning || '';
+        const artUrl = _librarySongArtUrl(song, providerId);
+        const isLocalProvider = _isLocalLibraryProvider(providerId);
+        const isSloppak = song.format === 'sloppak';
+        const stdRetune = isLocalProvider && localFilename && !isSloppak && tuning && !song.has_estd &&
             ['Eb Standard', 'D Standard', 'C# Standard', 'C Standard'].includes(tuning);
         const retuneBtn = stdRetune
-            ? `<button data-retune="${encodeURIComponent(s.filename)}" data-title="${encodeURIComponent(title)}" data-tuning="${tuning}" data-target="E Standard"
+            ? `<button data-retune="${encodeURIComponent(localFilename)}" data-title="${encodeURIComponent(title)}" data-tuning="${_escAttr(tuning)}" data-target="E Standard"
                 class="retune-btn mt-2 w-full px-2 py-1.5 bg-gold/10 hover:bg-gold/20 border border-gold/20 rounded-lg text-xs font-medium text-gold transition">
                 ⬆ Convert to E Standard</button>`
             : '';
-        const fmtBadge = formatBadge(s.format, s.stem_count);
-        const ariaLabel = `Play ${title || s.filename}${artist ? ' by ' + artist : ''}`;
-        return `<div class="song-card group" data-play="${encodeURIComponent(s.filename)}" data-artist="${_escAttr(artist || '')}" tabindex="0" role="button" aria-label="${_escAttr(ariaLabel)}">
+        const fmtBadge = formatBadge(song.format, song.stem_count);
+        const syncStatus = !localFilename ? _librarySyncStatusMarkup(providerId, songId) : '';
+        const actionButtons = isLocalProvider && localFilename
+            ? `${editBtn(song)}${heartBtn(localFilename, song.favorite)}`
+            : '';
+        const canSync = !localFilename && _providerSupports(providerId, 'song.sync');
+        const isInteractive = !!localFilename || canSync;
+        const providerAttr = `data-library-provider="${encodeURIComponent(providerId)}"`;
+        // For provider-backed entries, keep data-library-song alongside
+        // data-play once the song is synced so _restoreLibSelection can
+        // still match the persisted remote selection after a re-render.
+        const songAttr = !isLocalProvider ? ` data-library-song="${encodeURIComponent(songId)}"` : '';
+        const entryAttrs = localFilename
+            ? `data-play="${encodeURIComponent(localFilename)}" ${providerAttr}${songAttr}`
+            : `data-library-provider="${encodeURIComponent(providerId)}" data-library-song="${encodeURIComponent(songId)}"`;
+        const ariaAction = localFilename ? 'Play' : 'Load and play';
+        const ariaLabel = `${ariaAction} ${title || _libraryDisplayFilename(song, providerId)}${artist ? ' by ' + artist : ''}`;
+        const displayLabel = `${title || _libraryDisplayFilename(song, providerId)}${artist ? ' by ' + artist : ''}`;
+        const interactiveAttrs = isInteractive
+            ? `tabindex="0" role="button" aria-label="${_escAttr(ariaLabel)}"`
+            : `role="listitem" aria-label="${_escAttr(displayLabel)}"`;
+        const artHtml = artUrl
+            ? `<img src="${_escAttr(artUrl)}" alt="" loading="lazy" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">
+                <span class="placeholder" style="display:none">🎸</span>`
+            : `<span class="placeholder" style="display:flex">🎸</span>`;
+        return `<div class="song-card group" ${entryAttrs} data-artist="${_escAttr(artist || '')}" ${interactiveAttrs}>
             <div class="card-art">
-                <img src="${artUrl}" alt="" loading="lazy" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">
-                <span class="placeholder" style="display:none">🎸</span>
+                ${artHtml}
                 ${fmtBadge}
             </div>
             <div class="p-4">
@@ -1490,24 +1853,24 @@ function renderGridCards(songs, containerId = 'lib-grid', mode = 'replace') {
                         <p class="text-xs text-gray-500 truncate mt-0.5">${esc(artist)}</p>
                     </div>
                     <div class="flex gap-1">
-                        ${editBtn(s)}
-                        ${heartBtn(s.filename, s.favorite)}
+                        ${actionButtons}
                     </div>
                 </div>
                 <div class="flex items-center flex-wrap gap-1.5 mt-3 text-xs">
-                    ${(s.arrangements || []).map(a =>
+                    ${(song.arrangements || []).map(arrangement =>
                         `<span class="px-1.5 py-0.5 rounded ${
-                            a.name === 'Lead' ? 'bg-red-900/40 text-red-300' :
-                            a.name === 'Rhythm' ? 'bg-blue-900/40 text-blue-300' :
-                            a.name === 'Bass' ? 'bg-green-900/40 text-green-300' :
+                            arrangement.name === 'Lead' ? 'bg-red-900/40 text-red-300' :
+                            arrangement.name === 'Rhythm' ? 'bg-blue-900/40 text-blue-300' :
+                            arrangement.name === 'Bass' ? 'bg-green-900/40 text-green-300' :
                             'bg-dark-600 text-gray-400'
-                        }">${a.name}</span>`
+                        }">${esc(arrangement.name)}</span>`
                     ).join('')}
-                    ${tuning ? `<span class="px-1.5 py-0.5 rounded ${tuning === 'E Standard' ? 'bg-green-900/30 text-green-400' : 'bg-yellow-900/30 text-yellow-400'}">${tuning}</span>` : ''}
-                    ${s.has_lyrics ? `<span class="px-1.5 py-0.5 bg-purple-900/30 rounded text-purple-300">Lyrics</span>` : ''}
+                    ${tuning ? `<span class="px-1.5 py-0.5 rounded ${tuning === 'E Standard' ? 'bg-green-900/30 text-green-400' : 'bg-yellow-900/30 text-yellow-400'}">${esc(tuning)}</span>` : ''}
+                    ${song.has_lyrics ? `<span class="px-1.5 py-0.5 bg-purple-900/30 rounded text-purple-300">Lyrics</span>` : ''}
                     ${duration ? `<span class="text-gray-600">${duration}</span>` : ''}
                 </div>
                 ${retuneBtn}
+                ${syncStatus}
             </div>
         </div>`;
     }).join('');
@@ -1542,27 +1905,38 @@ function renderGridCards(songs, containerId = 'lib-grid', mode = 'replace') {
 // ── Tree View (server-side) ─────────────────────────────────────────────
 
 async function loadTreeView() {
+    const myEpoch = _libEpoch;
     if (!_treeStats) {
+        _setLibraryLoadingMessage('lib-tree', 'lib-count', _libraryLoadingText());
         const q = document.getElementById('lib-filter').value.trim();
         const format = (document.getElementById('lib-format') || {}).value || '';
         const sp = new URLSearchParams();
         if (q) sp.set('q', q);
         if (format) sp.set('format', format);
+        _applyLibraryProviderToParams(sp);
         _applyLibFiltersToParams(sp);
         const qs = sp.toString();
-        const resp = await fetch(`/api/library/stats${qs ? '?' + qs : ''}`);
-        _treeStats = await resp.json();
+        try {
+            _treeStats = await _fetchJsonOrThrow(`/api/library/stats${qs ? '?' + qs : ''}`);
+        } catch (error) {
+            if (myEpoch !== _libEpoch) return;
+            _treeStats = null;
+            _setLibraryOfflineMessage('lib-tree', 'lib-count', error.message || 'This source appears to be offline.');
+            return;
+        }
+        if (myEpoch !== _libEpoch) return;
     }
     const q = document.getElementById('lib-filter').value.trim();
-    await renderTreeInto('lib-tree', 'lib-count', _treeStats, _treeLetter, q, false);
+    await renderTreeInto('lib-tree', 'lib-count', _treeStats, _treeLetter, q, false, undefined, myEpoch);
 }
 
 let _treePage = 0;
 const TREE_PAGE_SIZE = 50;
 
-async function renderTreeInto(containerId, countId, stats, letter, q, favoritesOnly, page) {
+async function renderTreeInto(containerId, countId, stats, letter, q, favoritesOnly, page, expectedEpoch = _libEpoch) {
     if (page === undefined) page = favoritesOnly ? _favTreePage || 0 : _treePage;
     const container = document.getElementById(containerId);
+    const screenProviderId = favoritesOnly ? 'local' : _activeLibraryProviderId();
     const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ#'.split('');
     const chevron = `<svg class="chevron w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>`;
 
@@ -1588,13 +1962,21 @@ async function renderTreeInto(containerId, countId, stats, letter, q, favoritesO
     if (letter) params.set('letter', letter);
     if (q) params.set('q', q);
     if (favoritesOnly) params.set('favorites', '1');
+    else _applyLibraryProviderToParams(params);
     const format = (document.getElementById('lib-format') || {}).value || '';
     if (format) params.set('format', format);
     if (!favoritesOnly) _applyLibFiltersToParams(params);
     params.set('page', page);
     params.set('size', TREE_PAGE_SIZE);
-    const resp = await fetch(`/api/library/artists?${params}`);
-    const data = await resp.json();
+    let data;
+    try {
+        data = await _fetchJsonOrThrow(`/api/library/artists?${params}`);
+    } catch (error) {
+        if (expectedEpoch !== _libEpoch) return;
+        _setLibraryOfflineMessage(containerId, countId, error.message || 'This source appears to be offline.');
+        return;
+    }
+    if (expectedEpoch !== _libEpoch) return;
     const artists = data.artists || [];
     const totalArtists = data.total_artists || 0;
     const totalPages = Math.ceil(totalArtists / TREE_PAGE_SIZE);
@@ -1630,7 +2012,10 @@ async function renderTreeInto(containerId, countId, stats, letter, q, favoritesO
         html += `</div><div class="artist-body">`;
 
         for (const album of artist.albums) {
-            const artUrl = `/api/song/${encodeURIComponent(album.songs[0].filename)}/art${album.songs[0].mtime ? `?v=${Math.floor(album.songs[0].mtime)}` : ''}`;
+            const albumSongs = Array.isArray(album.songs) ? album.songs : [];
+            const artSong = albumSongs[0] || {};
+            const artProviderId = _libraryProviderIdForSong(artSong, screenProviderId);
+            const artUrl = _librarySongArtUrl(artSong, artProviderId);
             const albumHeuristicOpen = q || artist.albums.length === 1;
             const albumIsOpen = forceArtistOpen ? true : forceArtistClosed ? false : albumHeuristicOpen;
             const albumOpen = albumIsOpen ? ' open' : '';
@@ -1638,40 +2023,63 @@ async function renderTreeInto(containerId, countId, stats, letter, q, favoritesO
             html += `<div class="album-group${albumOpen}">`;
             html += `<div class="album-header" tabindex="0" role="button" aria-expanded="${albumIsOpen ? 'true' : 'false'}" aria-label="${albumAria}" onclick="_onHeaderClick(this)">`;
             html += chevron;
-            html += `<img src="${artUrl}" alt="" class="album-art-sm" loading="lazy" onerror="this.style.display='none'">`;
+            if (artUrl) html += `<img src="${_escAttr(artUrl)}" alt="" class="album-art-sm" loading="lazy" onerror="this.style.display='none'">`;
             html += `<span class="text-gray-300 text-sm flex-1">${esc(album.name)}</span>`;
-            html += `<span class="text-xs text-gray-600">${album.songs.length}</span>`;
+            html += `<span class="text-xs text-gray-600">${albumSongs.length}</span>`;
             html += `</div><div class="album-body">`;
 
-            for (const s of album.songs) {
-                const title = s.title || s.filename;
-                const duration = s.duration ? formatTime(s.duration) : '';
-                const tuning = s.tuning || '';
-                const isSloppak = s.format === 'sloppak';
-                const stdRetune = !isSloppak && tuning && !s.has_estd &&
+            for (const song of albumSongs) {
+                const providerId = _libraryProviderIdForSong(song, screenProviderId);
+                const localFilename = _libraryLocalFilename(song, providerId);
+                const songId = _librarySongId(song);
+                const title = _librarySongTitle(song, providerId);
+                const duration = song.duration ? formatTime(song.duration) : '';
+                const tuning = song.tuning || '';
+                const isLocalProvider = _isLocalLibraryProvider(providerId);
+                const isSloppak = song.format === 'sloppak';
+                const stdRetune = isLocalProvider && localFilename && !isSloppak && tuning && !song.has_estd &&
                     ['Eb Standard', 'D Standard', 'C# Standard', 'C Standard'].includes(tuning);
-                const rowAria = _escAttr(`Play ${title}${artist.name ? ' by ' + artist.name : ''}`);
-                html += `<div class="song-row" data-play="${encodeURIComponent(s.filename)}" data-artist="${_escAttr(artist.name || '')}" tabindex="0" role="button" aria-label="${rowAria}">`;
-                html += `<div class="flex-1 min-w-0 flex items-center gap-2"><span class="text-sm text-white truncate block">${esc(title)}</span>${formatBadgeInline(s.format, s.stem_count)}</div>`;
+                const canSyncRow = !localFilename && _providerSupports(providerId, 'song.sync');
+                const isInteractiveRow = !!localFilename || canSyncRow;
+                const providerAttr = `data-library-provider="${encodeURIComponent(providerId)}"`;
+                // Keep data-library-song alongside data-play for provider-backed
+                // entries once synced so _restoreLibSelection can still find the
+                // card after a post-sync re-render.
+                const rowSongAttr = !isLocalProvider ? ` data-library-song="${encodeURIComponent(songId)}"` : '';
+                const rowAttrs = localFilename
+                    ? `data-play="${encodeURIComponent(localFilename)}" ${providerAttr}${rowSongAttr}`
+                    : `data-library-provider="${encodeURIComponent(providerId)}" data-library-song="${encodeURIComponent(songId)}"`;
+                const ariaAction = localFilename ? 'Play' : 'Load and play';
+                const rowAria = _escAttr(`${ariaAction} ${title}${artist.name ? ' by ' + artist.name : ''}`);
+                const rowDisplayLabel = `${title}${artist.name ? ' by ' + artist.name : ''}`;
+                const rowInteractiveAttrs = isInteractiveRow
+                    ? `tabindex="0" role="button" aria-label="${rowAria}"`
+                    : `role="listitem" aria-label="${_escAttr(rowDisplayLabel)}"`;
+                html += `<div class="song-row" ${rowAttrs} data-artist="${_escAttr(artist.name || '')}" ${rowInteractiveAttrs}>`;
+                html += `<div class="flex-1 min-w-0 flex items-center gap-2"><span class="text-sm text-white truncate block">${esc(title)}</span>${formatBadgeInline(song.format, song.stem_count)}</div>`;
                 html += `<div class="flex items-center gap-1.5 flex-shrink-0 text-xs">`;
-                for (const a of (s.arrangements || [])) {
-                    const cls = a.name === 'Lead' ? 'bg-red-900/40 text-red-300' :
-                                a.name === 'Rhythm' ? 'bg-blue-900/40 text-blue-300' :
-                                a.name === 'Bass' ? 'bg-green-900/40 text-green-300' :
+                for (const arrangement of (song.arrangements || [])) {
+                    const cls = arrangement.name === 'Lead' ? 'bg-red-900/40 text-red-300' :
+                                arrangement.name === 'Rhythm' ? 'bg-blue-900/40 text-blue-300' :
+                                arrangement.name === 'Bass' ? 'bg-green-900/40 text-green-300' :
                                 'bg-dark-600 text-gray-400';
-                    html += `<span class="px-1.5 py-0.5 rounded ${cls}">${a.name}</span>`;
+                    html += `<span class="px-1.5 py-0.5 rounded ${cls}">${esc(arrangement.name)}</span>`;
                 }
                 if (tuning)
-                    html += `<span class="px-1.5 py-0.5 rounded ${tuning === 'E Standard' ? 'bg-green-900/30 text-green-400' : 'bg-yellow-900/30 text-yellow-400'}">${tuning}</span>`;
-                if (s.has_lyrics)
+                    html += `<span class="px-1.5 py-0.5 rounded ${tuning === 'E Standard' ? 'bg-green-900/30 text-green-400' : 'bg-yellow-900/30 text-yellow-400'}">${esc(tuning)}</span>`;
+                if (song.has_lyrics)
                     html += `<span class="px-1.5 py-0.5 bg-purple-900/30 rounded text-purple-300">Lyrics</span>`;
                 if (duration)
                     html += `<span class="text-gray-600 w-10 text-right">${duration}</span>`;
                 if (stdRetune)
-                    html += `<button data-retune="${encodeURIComponent(s.filename)}" data-title="${encodeURIComponent(title)}" data-tuning="${tuning}" data-target="E Standard"
+                    html += `<button data-retune="${encodeURIComponent(localFilename)}" data-title="${encodeURIComponent(title)}" data-tuning="${_escAttr(tuning)}" data-target="E Standard"
                         class="retune-btn px-1.5 py-0.5 bg-gold/10 hover:bg-gold/20 border border-gold/20 rounded text-gold" title="Convert to E Standard">E</button>`;
-                html += editBtn(s);
-                html += heartBtn(s.filename, s.favorite);
+                if (isLocalProvider && localFilename) {
+                    html += editBtn(song);
+                    html += heartBtn(localFilename, song.favorite);
+                } else if (!localFilename) {
+                    html += _librarySyncStatusMarkup(providerId, songId, 'inline');
+                }
                 html += `</div></div>`;
             }
             html += `</div></div>`;
@@ -1912,6 +2320,10 @@ function goFavTreePage(p) {
 
 // ── Settings ─────────────────────────────────────────────────────────────
 async function loadSettings() {
+    // App Updates UI does not depend on /api/settings — run it first so a
+    // failed fetch below still leaves the desktop updater wired up.
+    // setupAppUpdates() is idempotent via _appUpdatesWired.
+    setupAppUpdates();
     const resp = await fetch('/api/settings');
     const data = await resp.json();
     document.getElementById('dlc-path').value = data.dlc_dir || '';
@@ -1927,7 +2339,10 @@ async function loadSettings() {
         : 100;
     const masterySlider = document.getElementById('mastery-slider');
     const masteryLabel = document.getElementById('mastery-label');
-    if (masterySlider) masterySlider.value = masteryPct;
+    if (masterySlider) {
+        masterySlider.value = masteryPct;
+        handleSliderInput(masterySlider);
+    }
     if (masteryLabel) masteryLabel.textContent = masteryPct + '%';
     highway.setMastery(masteryPct / 100);
     // Route the loaded value through setAvOffsetMs so the highway's
@@ -1941,6 +2356,318 @@ async function loadSettings() {
     if (window.slopsmithDesktop && typeof window.slopsmithDesktop.pickDirectory === 'function') {
         document.getElementById('btn-pick-dlc')?.classList.remove('hidden');
     }
+}
+
+// ── App Updates (desktop-only) ───────────────────────────────────────────
+// Velopack auto-update controls, rendered as the first block of the Settings
+// page. Whole block stays hidden in the plain web app; unhide + wire only
+// when the slopsmith-desktop bridge (window.slopsmithDesktop.update) is
+// present. On Linux the block renders but its controls are disabled — the
+// desktop reports platform === 'linux' and short-circuits the IPC.
+
+const APP_UPDATE_CHANNELS = ['stable', 'rc', 'beta', 'alpha'];
+let _appUpdatesWired = false;
+
+function setupAppUpdates() {
+    const block = document.getElementById('app-updates-block');
+    if (!block) return;
+    const updateApi = window.slopsmithDesktop?.update;
+    // Per-method capability check: an older or partial slopsmith-desktop
+    // bridge may expose `update` without the full shape. Skip wiring (and
+    // leave the block hidden) rather than throwing on first interaction.
+    if (!updateApi
+        || typeof updateApi.getStatus !== 'function'
+        || typeof updateApi.setChannel !== 'function'
+        || typeof updateApi.checkNow !== 'function') {
+        return;
+    }
+
+    block.classList.remove('hidden');
+
+    const channelSelect = document.getElementById('app-update-channel');
+    const checkBtn = document.getElementById('app-update-check-now');
+    const statusEl = document.getElementById('app-update-status');
+    const linuxNote = document.getElementById('app-update-linux-note');
+    if (!channelSelect || !checkBtn || !statusEl) return;
+
+    // localStorage access can throw in storage-restricted contexts (sandbox
+    // iframes, privacy modes, etc.); fall back to the default channel so the
+    // panel still renders rather than aborting wiring entirely.
+    let storedRaw = null;
+    try { storedRaw = localStorage.getItem('slopsmith-update-channel'); } catch (_) { /* fall through */ }
+    const stored = APP_UPDATE_CHANNELS.includes(storedRaw) ? storedRaw : 'stable';
+    channelSelect.value = stored;
+
+    const isLinux = window.slopsmithDesktop?.platform === 'linux';
+
+    function showLinuxFallback(message) {
+        if (linuxNote) linuxNote.classList.remove('hidden');
+        channelSelect.disabled = true;
+        checkBtn.disabled = true;
+        statusEl.textContent = message || 'Auto-update is not available on this platform.';
+    }
+
+    function fmtTimestamp(ts) {
+        if (!ts) return 'never';
+        try {
+            const d = new Date(ts);
+            return Number.isNaN(d.getTime()) ? 'never' : d.toLocaleString();
+        } catch (_) { return 'never'; }
+    }
+
+    function renderStatus(extra) {
+        try {
+            // Wrap in Promise.resolve so a future getStatus() that returns
+            // synchronously won't blow up on .then().
+            void Promise.resolve(updateApi.getStatus()).then((s) => {
+                if (!s) { statusEl.textContent = extra || 'Updater status unavailable.'; return; }
+                if (s.status === 'unsupported' || s.platform === 'linux') {
+                    showLinuxFallback('Auto-update is not available on Linux.');
+                    return;
+                }
+                if (s.status === 'error') {
+                    const errMsg = s.message ? `Update error: ${s.message}` : 'Update check failed.';
+                    statusEl.textContent = extra ? `${extra} · ${errMsg}` : errMsg;
+                    return;
+                }
+                const parts = [
+                    `Version ${s.currentVersion || '?'}`,
+                    `channel ${s.channel || channelSelect.value}`,
+                    `last checked ${fmtTimestamp(s.lastChecked)}`,
+                ];
+                statusEl.textContent = extra ? `${extra} · ${parts.join(' · ')}` : parts.join(' · ');
+            }).catch((e) => {
+                console.warn('[updater] getStatus failed:', e);
+                statusEl.textContent = extra || 'Failed to read updater status.';
+            });
+        } catch (e) {
+            console.warn('[updater] getStatus threw:', e);
+            statusEl.textContent = extra || 'Failed to read updater status.';
+        }
+    }
+
+    if (isLinux) {
+        showLinuxFallback('Auto-update is not available on Linux.');
+        // Keep main informed of the persisted channel even on Linux so
+        // cross-platform reasoning about the channel stays consistent.
+        // setChannel() may return a Promise — chain .catch() so a rejected
+        // promise doesn't surface as an unhandled rejection.
+        try {
+            void Promise.resolve(updateApi.setChannel(stored)).catch((e) => {
+                console.warn('[updater] setChannel(linux) failed:', e);
+            });
+        } catch (e) {
+            console.warn('[updater] setChannel(linux) threw:', e);
+        }
+        return;
+    }
+
+    // Inform main of the persisted channel on each load. setChannel() on
+    // main is idempotent when the channel already matches.
+    try {
+        void Promise.resolve(updateApi.setChannel(stored)).catch((e) => {
+            console.warn('[updater] setChannel(initial) failed:', e);
+        });
+    } catch (e) {
+        console.warn('[updater] setChannel(initial) threw:', e);
+    }
+
+    if (!_appUpdatesWired) {
+        // Wire DOM listeners once. The elements live in static index.html
+        // and are not recreated, so re-wiring on every loadSettings() call
+        // would just stack duplicate handlers.
+        channelSelect.addEventListener('change', async () => {
+            const val = channelSelect.value;
+            if (!APP_UPDATE_CHANNELS.includes(val)) return;
+            try { localStorage.setItem('slopsmith-update-channel', val); } catch (_) {}
+            try {
+                // Await setChannel so the status line reflects what actually
+                // happened — rendering "Channel set" unconditionally would
+                // mislead users when the IPC rejects.
+                await Promise.resolve(updateApi.setChannel(val));
+                renderStatus(`Channel set to ${val}.`);
+            } catch (e) {
+                console.warn('[updater] setChannel failed:', e);
+                renderStatus(`Failed to set channel to ${val}: ${e?.message || e}`);
+            }
+        });
+
+        checkBtn.addEventListener('click', async () => {
+            checkBtn.disabled = true;
+            statusEl.textContent = 'Checking for updates…';
+            let reEnableBtn = true;
+            try {
+                const result = await updateApi.checkNow();
+                const status = result?.status || 'unknown';
+                let msg;
+                switch (status) {
+                    case 'idle':
+                        msg = "You're on the newest version in this channel.";
+                        break;
+                    case 'downloading':
+                        msg = 'Update available — downloading…';
+                        break;
+                    case 'downloaded':
+                        msg = 'Update downloaded — restart to apply.';
+                        break;
+                    case 'unsupported':
+                        reEnableBtn = false;
+                        showLinuxFallback('Auto-update is not available on Linux.');
+                        return;
+                    case 'error':
+                        msg = `Update check failed${result?.message ? `: ${result.message}` : '.'}`;
+                        break;
+                    default:
+                        msg = `Update check returned: ${status}`;
+                }
+                renderStatus(msg);
+            } catch (e) {
+                console.warn('[updater] checkNow failed:', e);
+                statusEl.textContent = `Update check failed: ${e?.message || e}`;
+            } finally {
+                if (reEnableBtn) checkBtn.disabled = false;
+            }
+        });
+
+        _appUpdatesWired = true;
+    }
+
+    renderStatus();
+}
+
+// ── Restart banner (desktop-only) ────────────────────────────────────────
+// Subscribes to window.slopsmithDesktop.update.onDownloaded and renders a
+// persistent banner with a "Restart now" button. Runs once at app boot so a
+// download finishing while the user is on a non-Settings screen still pops
+// the banner.
+
+function initAppUpdateBanner() {
+    const updateApi = window.slopsmithDesktop?.update;
+    // Same capability gate as setupAppUpdates — the banner needs onDownloaded
+    // to subscribe, getStatus to detect pre-existing pending updates on boot,
+    // and apply to actually restart from the button. A bridge missing any
+    // of these would partially fail; better to no-op cleanly.
+    if (!updateApi
+        || typeof updateApi.onDownloaded !== 'function'
+        || typeof updateApi.getStatus !== 'function'
+        || typeof updateApi.apply !== 'function') {
+        return;
+    }
+
+    const BANNER_ID = 'slopsmith-update-banner';
+
+    function renderUpdateBanner(payload) {
+        // Avoid stacking duplicate banners if onDownloaded fires more than once.
+        if (document.getElementById(BANNER_ID)) return;
+
+        const banner = document.createElement('div');
+        banner.id = BANNER_ID;
+        banner.setAttribute('role', 'status');
+        banner.style.cssText = [
+            'position:fixed', 'top:0', 'left:0', 'right:0',
+            'z-index:99999', 'padding:10px 16px',
+            'background:linear-gradient(90deg,#1e3a8a,#4338ca)',
+            'color:#fff', 'font-size:13px',
+            'font-family:system-ui,sans-serif',
+            'display:flex', 'align-items:center', 'justify-content:space-between',
+            'gap:12px', 'box-shadow:0 2px 8px rgba(0,0,0,0.4)',
+        ].join(';');
+
+        const text = document.createElement('span');
+        const version = payload && payload.version ? ` (${payload.version})` : '';
+        text.textContent = `Update downloaded${version} — restart to apply.`;
+
+        const actions = document.createElement('span');
+        actions.style.cssText = 'display:flex;gap:8px;align-items:center';
+
+        const restartBtn = document.createElement('button');
+        restartBtn.textContent = 'Restart now';
+        restartBtn.style.cssText = [
+            'padding:4px 12px', 'border-radius:4px',
+            'background:#fff', 'color:#1e3a8a', 'border:none',
+            'font-weight:600', 'cursor:pointer', 'font-size:13px',
+        ].join(';');
+        restartBtn.addEventListener('click', async () => {
+            restartBtn.disabled = true;
+            restartBtn.textContent = 'Restarting…';
+            try {
+                // apply() can resolve with { status: 'error' } instead of
+                // throwing; only re-enable the button on that path.
+                const result = await updateApi.apply();
+                if (result?.status === 'error') {
+                    console.warn('[updater] apply returned error:', result.message || 'unknown');
+                    restartBtn.disabled = false;
+                    restartBtn.textContent = 'Restart now';
+                }
+            } catch (e) {
+                console.warn('[updater] apply failed:', e);
+                restartBtn.disabled = false;
+                restartBtn.textContent = 'Restart now';
+            }
+        });
+
+        const dismissBtn = document.createElement('button');
+        dismissBtn.textContent = 'Later';
+        dismissBtn.setAttribute('aria-label', 'Dismiss update banner');
+        dismissBtn.style.cssText = [
+            'padding:4px 10px', 'border-radius:4px',
+            'background:transparent', 'color:#fff',
+            'border:1px solid rgba(255,255,255,0.3)',
+            'cursor:pointer', 'font-size:13px',
+        ].join(';');
+        dismissBtn.addEventListener('click', () => banner.remove());
+
+        actions.appendChild(restartBtn);
+        actions.appendChild(dismissBtn);
+        banner.appendChild(text);
+        banner.appendChild(actions);
+
+        const insert = () => {
+            if (document.body) document.body.appendChild(banner);
+            else document.addEventListener('DOMContentLoaded', () => document.body.appendChild(banner), { once: true });
+        };
+        insert();
+    }
+
+    try {
+        updateApi.onDownloaded((payload) => {
+            try { renderUpdateBanner(payload); }
+            catch (e) { console.warn('[updater] renderUpdateBanner failed:', e); }
+        });
+    } catch (e) {
+        console.warn('[updater] onDownloaded subscribe failed:', e);
+    }
+
+    // Catch pre-existing pending updates (downloaded in a previous session,
+    // or restored on launch). onDownloaded only fires for downloads that
+    // complete in the current session, so do an explicit status check too.
+    try {
+        void Promise.resolve(updateApi.getStatus()).then((status) => {
+            // Render the banner for any 'downloaded' status; the version
+            // string is best-effort — renderUpdateBanner() already drops the
+            // "(vX.Y.Z)" suffix when none is supplied, so an update reported
+            // without pending.version still surfaces the restart prompt.
+            if (status && status.status === 'downloaded') {
+                renderUpdateBanner({ version: status.pending?.version, channel: status.channel });
+            }
+        }).catch((e) => {
+            console.warn('[updater] getStatus on init failed:', e);
+        });
+    } catch (e) {
+        console.warn('[updater] getStatus on init threw:', e);
+    }
+}
+
+// Updates the fill on slider elements. Expects a CSS variable --range-pct used
+// in the track fill styling. Declared as a function (not a const) so it is
+// hoisted onto window — audio-mixer.js calls it as window.handleSliderInput,
+// matching the window.playSong / window.showScreen cross-script convention.
+function handleSliderInput(el) {
+    if (!el) return;
+    const min = el.min || 0;
+    const max = el.max || 100;
+    const pct = (el.value - min) / (max - min) * 100;
+    el.style.setProperty('--range-pct', pct + '%');
 }
 
 // A/V sync calibration. Positive = audio runs ahead of visuals; we
@@ -1966,12 +2693,18 @@ function setAvOffsetMs(ms, skipPersist) {
     if (typeof highway !== 'undefined' && highway?.setAvOffset) highway.setAvOffset(_avOffsetMs);
     // Sync any visible Settings slider
     const avSlider = document.getElementById('setting-av-offset');
-    if (avSlider) avSlider.value = _avOffsetMs;
+    if (avSlider) {
+        avSlider.value = _avOffsetMs;
+        handleSliderInput(avSlider);
+    }
     const avVal = document.getElementById('setting-av-offset-val');
     if (avVal) avVal.textContent = Math.round(_avOffsetMs);
     // Sync the inline player-bar slider (live-tunable while playing)
     const playerAvSlider = document.getElementById('player-av-offset-slider');
-    if (playerAvSlider) playerAvSlider.value = _avOffsetMs;
+    if (playerAvSlider) {
+        playerAvSlider.value = _avOffsetMs;
+        handleSliderInput(playerAvSlider);
+    }
     const playerAvLabel = document.getElementById('player-av-offset-label');
     if (playerAvLabel) {
         const rounded = Math.round(_avOffsetMs);
@@ -2029,6 +2762,42 @@ async function saveSettings() {
     });
     const data = await resp.json();
     document.getElementById('settings-status').textContent = data.message || data.error;
+}
+
+// Persist a single settings field the instant a control changes (used by
+// the Settings dropdowns). The /api/settings POST handler merges only the
+// keys present in the body, so this one-field write won't clobber dlc_dir
+// or any other setting. No debounce: a <select> change event fires once
+// per selection, unlike the A/V / mastery sliders' per-pixel oninput.
+//
+// The Settings-dropdown autosaves run through one chain so their POSTs are
+// sent one at a time, in the order the user made the changes — the last
+// selection is always the last write, for both rapid changes to one
+// dropdown and back-to-back changes across different dropdowns. The A/V
+// and mastery slider autosaves POST directly (not through this chain);
+// the server-side config.json lock is what keeps those from racing the
+// dropdown writes (see save_settings() in server.py).
+let _settingSaveChain = Promise.resolve();
+function persistSetting(key, value) {
+    const next = _settingSaveChain.then(() => _postSetting(key, value));
+    // Swallow failures so one failed write doesn't poison the chain and
+    // block every later save.
+    _settingSaveChain = next.catch(() => {});
+    return next;
+}
+async function _postSetting(key, value) {
+    const status = document.getElementById('settings-status');
+    try {
+        const resp = await fetch('/api/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ [key]: value }),
+        });
+        const data = await resp.json();
+        if (status) status.textContent = data.message || data.error || '';
+    } catch (e) {
+        if (status) status.textContent = 'Save failed: ' + e.message;
+    }
 }
 
 // ── Settings export / import (slopsmith#113) ─────────────────────────────────
@@ -2819,11 +3588,13 @@ const jucePlayer = {
     _dur: 0,
     _pollAt: 0,    // performance.now() when _pos was last set
     _polling: false,
+    _speed: 1,
     get currentTime() {
         if (!this._polling) return this._pos;
         // Interpolate between IPC polls so highway motion is smooth at 60fps
+        // Scale by _speed so at 0.7x the interpolated clock advances 0.7s/s
         const elapsed = (performance.now() - this._pollAt) / 1000;
-        return Math.min(this._pos + elapsed, this._dur > 0 ? this._dur : Infinity);
+        return Math.min(this._pos + elapsed * this._speed, this._dur > 0 ? this._dur : Infinity);
     },
     get duration() { return this._dur; },
     async play() {
@@ -2885,11 +3656,17 @@ const jucePlayer = {
         this._polling = false;
         if (this._timer) { clearTimeout(this._timer); this._timer = null; }
     },
+    setRate(rate) {
+        this._pos = this.currentTime;
+        this._pollAt = performance.now();
+        this._speed = rate;
+    },
     async stop() {
         await this.pause();
         this._pos = 0;
         this._dur = 0;
         this._pollAt = 0;
+        this._speed = 1;
     },
 };
 window.jucePlayer = jucePlayer;
@@ -3002,6 +3779,8 @@ window.jucePlayer = jucePlayer;
             }
             window._juceMode = true;
             window._juceAudioUrl = url;
+            const _spSlider = document.getElementById?.('speed-slider');
+            if (_spSlider) setSpeed(_spSlider.value / 100);
             audio.src = '';
             try {
                 const apply = window.slopsmith?.audio?.applySongVolume;
@@ -3062,6 +3841,8 @@ window.jucePlayer = jucePlayer;
             window._juceAudioUrl = null;
             audio.src = url;
             audio.load();
+            const _spSlider = document.getElementById?.('speed-slider');
+            if (_spSlider) setSpeed(_spSlider.value / 100);
             // Resume only AFTER the seek so playback starts at `pos`, not at 0
             // with an audible jump once metadata arrives.
             const resumeAtPos = () => {
@@ -3625,6 +4406,7 @@ async function playSong(filename, arrangement) {
     isPlaying = false;
     document.getElementById('btn-play').textContent = '▶ Play';
     document.getElementById('speed-slider').value = 100;
+    handleSliderInput(document.getElementById('speed-slider'));
     document.getElementById('speed-label').textContent = '1.0x';
     clearLoop();
 
@@ -3748,14 +4530,22 @@ async function seekBy(s) {
     await _audioSeek(Math.max(0, _audioTime() + s), 'seek-by');
 }
 function setSpeed(v) {
-    if (window._juceMode) {
-        audio.playbackRate = 1.0;
-        document.getElementById('speed-slider').value = 100;
-        document.getElementById('speed-label').textContent = '1.0x';
+    const speedSlider = document.getElementById('speed-slider');
+    const rate = Number(v);
+    if (!Number.isFinite(rate)) {
         return;
     }
-    audio.playbackRate = parseFloat(v);
-    document.getElementById('speed-label').textContent = parseFloat(v).toFixed(2) + 'x';
+    if (window._juceMode) {
+        window.jucePlayer?.setRate(rate);
+        Promise.resolve()
+            .then(() => window.slopsmithDesktop?.audio?.setBackingSpeed(rate))
+            .catch(err => console.warn('[setSpeed] setBackingSpeed failed:', err));
+    } else {
+        audio.playbackRate = rate;
+    }
+    const speedLabel = document.getElementById('speed-label');
+    if (speedLabel) speedLabel.textContent = rate.toFixed(2) + 'x';
+    handleSliderInput(speedSlider);
 }
 // Master-difficulty slider (slopsmith#48). Persists partial via
 // /api/settings — the POST handler merges only the keys present, so
@@ -3785,6 +4575,7 @@ function setMastery(v) {
     if (!Number.isFinite(parsed)) return;
     const pct = Math.max(0, Math.min(100, parsed));
     document.getElementById('mastery-label').textContent = pct + '%';
+    handleSliderInput(document.getElementById('mastery-slider'));
     highway.setMastery(pct / 100);
     _persistMastery(pct);
 }
@@ -5456,6 +6247,63 @@ function _removeLibCardsForFilename(filename) {
     _bumpLibNavGeneration();
 }
 
+async function syncLibrarySong(providerId, songId, { playWhenReady = false } = {}) {
+    if (!providerId || !songId) return;
+    const currentState = _librarySyncState(providerId, songId);
+    if (currentState && currentState.status === 'synced' && currentState.localFilename) {
+        if (playWhenReady) playSong(encodeURIComponent(currentState.localFilename));
+        return currentState.result || { filename: currentState.localFilename };
+    }
+    if (currentState && currentState.status === 'syncing') return null;
+    _setLibrarySyncState(providerId, songId, { status: 'syncing' });
+    try {
+        const response = await fetch(
+            `/api/library/providers/${encodeURIComponent(providerId)}/songs/${encodeURIComponent(songId)}/sync`,
+            { method: 'POST' },
+        );
+        let data = {};
+        try { data = await response.json(); } catch { data = {}; }
+        if (!response.ok) throw new Error(data.detail || data.error || `HTTP ${response.status}`);
+        const localFilename = data.filename || data.localFilename || data.local_filename || data.playFilename || data.play_filename || '';
+        const message = localFilename
+            ? 'Ready to play'
+            : (data.cachedPath ? 'Loaded to local cache' : 'Loaded');
+        _setLibrarySyncState(providerId, songId, { status: 'synced', message, localFilename, result: data });
+        _treeStats = null;
+        _favTreeStats = null;
+        _tuningNames = null;
+        _libEpoch++;
+        await loadLibrary(0);
+        if (playWhenReady && localFilename) playSong(encodeURIComponent(localFilename));
+        return data;
+    } catch (error) {
+        _setLibrarySyncState(providerId, songId, { status: 'error', message: error.message || 'Unknown error' });
+        console.warn('Remote library load failed:', error);
+        return null;
+    }
+}
+
+function _setLibrarySyncState(providerId, songId, state) {
+    _librarySyncStates.set(_librarySyncKey(providerId, songId), state);
+    _renderLibrarySyncState(providerId, songId);
+}
+
+function _renderLibrarySyncState(providerId, songId) {
+    const state = _librarySyncState(providerId, songId);
+    // Filter via dataset rather than building a CSS attribute selector —
+    // CSS.escape is absent in some test environments and older runtimes,
+    // and provider/song IDs are not constrained to CSS-safe strings.
+    const encodedProvider = encodeURIComponent(providerId);
+    const encodedSong = encodeURIComponent(songId);
+    for (const status of document.querySelectorAll('[data-library-sync-status]')) {
+        if (status.dataset.librarySyncProvider !== encodedProvider) continue;
+        if (status.dataset.librarySyncSong !== encodedSong) continue;
+        const layout = status.classList.contains('ml-1') ? 'inline' : 'block';
+        status.className = _librarySyncStatusClass(state, layout);
+        status.textContent = _librarySyncStatusText(state);
+    }
+}
+
 // Delegated click handlers
 document.addEventListener('click', e => {
     // Edit button
@@ -5478,6 +6326,19 @@ document.addEventListener('click', e => {
     if (btn) {
         e.stopPropagation();
         retuneSong(btn.dataset.retune, decodeURIComponent(btn.dataset.title), btn.dataset.tuning, btn.dataset.target || 'E Standard');
+        return;
+    }
+    // Remote song card / row without a local playable file yet.
+    const remoteEntry = e.target.closest('[data-library-song]');
+    if (remoteEntry && !remoteEntry.dataset.play && !e.target.closest('button')) {
+        const providerId = decodeURIComponent(remoteEntry.dataset.libraryProvider || '');
+        if (!_providerSupports(providerId, 'song.sync')) return;
+        _setLibSelection(remoteEntry, { focus: false });
+        syncLibrarySong(
+            providerId,
+            decodeURIComponent(remoteEntry.dataset.librarySong || ''),
+            { playWhenReady: true },
+        );
         return;
     }
     // Song card / row — keep persistent selection in sync with mouse
@@ -6100,6 +6961,7 @@ async function bootstrapPluginsAndUi() {
         try { await showScreen('player'); }
         catch (e) { console.warn('[slopsmith] follower-window: showScreen("player") failed:', e); }
     }
+    await loadLibraryProviders({ restoreSaved: true });
     // Restore library-filter UI state from localStorage before the first
     // grid fetch so the badge/chips are accurate immediately
     // (slopsmith#129).
@@ -6130,9 +6992,19 @@ async function bootstrapPluginsAndUi() {
     // toggling and triggers the initial load.
     setLibView(libView);
     try { await loadSettings(); } catch (e) { console.warn('initial loadSettings failed:', e); }
+    // App-wide restart banner — must wire once, outside loadSettings(), so a
+    // download finishing while the user is on a non-Settings screen still
+    // pops the banner.
+    try { initAppUpdateBanner(); } catch (e) { console.warn('initAppUpdateBanner failed:', e); }
+    // Seed the track fill on every themed slider so they render correctly
+    // before any interaction — e.g. the speed slider (untouched by
+    // loadSettings) before the first playSong, or follower windows that
+    // enter the player screen via showScreen('player') without playSong.
+    document.querySelectorAll('.slider-input').forEach(el => handleSliderInput(el));
     checkScanAndLoad();
 
     const plugins = await bootstrapPluginsAndUi();
+    await loadLibraryProviders({ restoreSaved: true, reloadOnChange: true });
     // Viz picker depends on plugin scripts having loaded (to find
     // window.slopsmithViz_<id> factories), so run it after loadPlugins.
     // Reuse the plugin list loadPlugins just fetched — no need to

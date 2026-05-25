@@ -348,7 +348,7 @@ html { scroll-behavior: smooth; }
 #lib-filter-drawer .filter-pill.state-exclude::before {
     background: #f87171;
     /* tiny minus indicator: use a horizontal bar instead of dot */
-    width: 10px;
+    width: 12px;
     height: 2px;
     border-radius: 1px;
 }
@@ -430,11 +430,50 @@ html { scroll-behavior: smooth; }
 #mixer-popover .mixer-strip-fader {
     width: 110px;
     height: 24px;
-    margin: 0;
+    margin: 55px 0 0 0; /* Push the fader down so the track is centered under the label text */
     padding: 0;
     vertical-align: middle;
     transform: rotate(-90deg);
     transform-origin: center;
+    -webkit-appearance: none;
+    background: transparent;
+    cursor: pointer;
+}
+#mixer-popover .mixer-strip-fader::-webkit-slider-runnable-track {
+  height: 16px; /* Match the Firefox ::-moz-range-track height so the fader renders consistently across browsers */
+  background: linear-gradient(to right, rgb(var(--sm-accent, 64, 128, 224)) var(--range-pct, 0%), rgb(var(--sm-bg-900, 10, 10, 18)) var(--range-pct, 0%));
+  border-radius: 8px;
+  border: 1px solid rgb(55 65 81 / var(--tw-border-opacity, 1));
+}
+#mixer-popover .mixer-strip-fader::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  height: 0px;
+  width: 0px;
+  background: #ffffff;
+  border-radius: 0px;
+  margin-top: 9px;
+  opacity: 0;
+}
+/* --- Firefox --- */
+#mixer-popover .mixer-strip-fader::-moz-range-track {
+  height: 16px;
+  background: linear-gradient(to right, rgb(var(--sm-accent, 64, 128, 224)) var(--range-pct, 0%), rgb(var(--sm-bg-900, 10, 10, 18)) var(--range-pct, 0%));
+  border-radius: 8px;
+  border: 1px solid rgb(55 65 81 / var(--tw-border-opacity, 1));
+}
+
+#mixer-popover .mixer-strip-fader::-moz-range-thumb {
+  height: 0px;
+  width: 0px;
+  background: #ffffff;
+  border-radius: 0px;
+  border: 0;
+}
+#mixer-popover .mixer-strip-value { 
+    font-size: 10px;
+    color: #6b7280;
+    font-variant-numeric: tabular-nums;
+    margin-top: 55px;
 }
 @supports ((-webkit-appearance: slider-vertical) or (appearance: slider-vertical)) {
     #mixer-popover .mixer-strip-fader {
@@ -446,9 +485,17 @@ html { scroll-behavior: smooth; }
         direction: rtl;
         -webkit-appearance: slider-vertical;
         appearance: slider-vertical;
+        margin: 0;
+    }
+    #mixer-popover .mixer-strip-fader::-webkit-slider-runnable-track {
+        height: auto; /* Vertical slider: let the track span the full length instead of the fixed 16px used by the rotated fallback */
+        background: linear-gradient(to top, rgb(var(--sm-accent, 64, 128, 224)) var(--range-pct, 0%), rgb(var(--sm-bg-900, 10, 10, 18)) var(--range-pct, 0%));
+        border-radius: 8px;
+    }
+    #mixer-popover .mixer-strip-value { 
+        margin-top: 0;
     }
 }
-#mixer-popover .mixer-strip-value { font-size: 10px; color: #6b7280; font-variant-numeric: tabular-nums; }
 #mixer-popover .mixer-row {
     display: flex;
     justify-content: center;
@@ -458,4 +505,53 @@ html { scroll-behavior: smooth; }
     width: max-content;
     overflow: visible;
     flex-wrap: nowrap;
+    min-height: 134px; /* Fix for incorrect height in firefox */
 }
+/* ////// start sliders /////// */
+.slider-input {
+  -webkit-appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+
+/* --- Webkit Browsers --- */
+.slider-input::-webkit-slider-runnable-track {
+  height: 26px;
+  background: linear-gradient(to right, rgb(var(--sm-accent, 64, 128, 224)) var(--range-pct, 0%), rgb(var(--sm-bg-600, 35, 35, 50)) var(--range-pct, 0%));
+  border-radius: 8px;
+  border: 1px solid rgb(55 65 81 / var(--tw-border-opacity, 1));
+}
+
+.slider-input::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  height: 22px;
+  width: 12px;
+  background: #ffffff;
+  border-radius: 4px;
+  margin-top: 1px;
+  cursor: grab;
+  box-shadow: 0 0 0 1px rgb(0 0 0 / 0.4);
+}
+
+.slider-input::-webkit-slider-thumb:active { cursor: grabbing; }
+
+/* --- Firefox --- */
+.slider-input::-moz-range-track {
+  height: 26px;
+  background: linear-gradient(to right, rgb(var(--sm-accent, 64, 128, 224)) var(--range-pct, 0%), rgb(var(--sm-bg-600, 35, 35, 50)) var(--range-pct, 0%));
+  border-radius: 8px;
+  border: 1px solid rgb(55 65 81 / var(--tw-border-opacity, 1));
+}
+
+.slider-input::-moz-range-thumb {
+  height: 22px;
+  width: 12px;
+  background: #ffffff;
+  border-radius: 4px;
+  border: 0;
+  cursor: grab;
+  box-shadow: 0 0 0 1px rgb(0 0 0 / 0.4);
+}
+
+.slider-input::-moz-range-thumb:active { cursor: grabbing; }
+/* ////// end sliders /////// */

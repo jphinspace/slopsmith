@@ -190,6 +190,7 @@ function _strip(spec) {
     slider.step = String(spec.step);
     slider.value = String(cur);
     slider.setAttribute('aria-label', spec.label + ' volume');
+    window.handleSliderInput?.(slider); //initialize the slider's background fill based on the initial value
 
     const valueEl = document.createElement('span');
     valueEl.className = 'mixer-strip-value';
@@ -227,6 +228,7 @@ function _strip(spec) {
         actual = _clampToSpec(actual, spec);
         cur = actual;
         slider.value = String(actual);
+        window.handleSliderInput?.(slider); //update the slider's background fill on input
         valueEl.textContent = _formatValue(actual, spec.unit);
     });
 
