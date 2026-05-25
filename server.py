@@ -4507,15 +4507,27 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
                 try:
                     root = ET.parse(xml_path).getroot()
                     if root.tag == "vocals":
-                        for v in root.findall("vocal"):
-                            lyrics.append({
+                        # Some official DLC ships an empty <vocals/> shell
+                        # alongside the real SNG, so only stop scanning
+                        # when the XML actually produced lyric tokens.
+                        # An empty shell here would otherwise short-circuit
+                        # later XML files (and the SNG fallback below
+                        # checks `if not lyrics:` so it would still try,
+                        # but a meaningful XML further down the rglob
+                        # would be missed). Mirrors the lib helper at
+                        # lib/sloppak_convert.py:_parse_lyrics_with_source.
+                        candidate = [
+                            {
                                 "t": round(float(v.get("time", "0")), 3),
                                 "d": round(float(v.get("length", "0")), 3),
                                 "w": v.get("lyric", ""),
-                            })
-                        if lyrics:
+                            }
+                            for v in root.findall("vocal")
+                        ]
+                        if candidate:
+                            lyrics = candidate
                             lyrics_source = "xml"
-                        break
+                            break
                 except Exception:
                     pass
             if not lyrics:

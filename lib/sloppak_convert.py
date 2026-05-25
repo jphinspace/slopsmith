@@ -1068,11 +1068,14 @@ def _maybe_transcribe_lyrics(
 
     # Build the lyric_transcription metadata block per the
     # stem_separation RFC pattern (slopsmith#357). Engine + schema
-    # version are always known; `model` is what we picked locally OR
-    # the WhisperX server's reported choice when remote (defer remote
-    # introspection to a follow-up — for now stamp the config value
-    # the request was made with, marked `_requested` so we don't lie
-    # about server-side overrides).
+    # version are always known. `model` is the value we *requested* —
+    # the local path uses exactly that; the remote path *should* run
+    # the same model on the server but we don't currently introspect
+    # the server's response to confirm. A `requested` vs `actual`
+    # split (or a separate `lyric_transcription.server_model` field)
+    # is a follow-up for when the remote WhisperX server reports its
+    # configuration. Documenting it as the requested value here keeps
+    # the contract honest until then.
     from lyrics_transcribe import (
         LYRIC_TRANSCRIPTION_ENGINE,
         LYRIC_TRANSCRIPTION_SCHEMA_VERSION,

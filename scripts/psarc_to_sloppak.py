@@ -93,8 +93,8 @@ def _wem_to_ogg(wem_path: str, out_ogg: Path) -> None:
             )
 
 
-def _parse_lyrics(extracted_dir: Path) -> list[dict]:
-    """Return compact-wire lyric tokens from vocals XML OR SNG in the extract.
+def _parse_lyrics_with_source(extracted_dir: Path) -> tuple[list[dict], str | None]:
+    """Return (lyric tokens, provenance) from vocals XML OR SNG in the extract.
 
     Delegates to the library implementation (`lib/sloppak_convert.py`)
     so this script stays in lockstep with it — official DLC ships
@@ -102,9 +102,9 @@ def _parse_lyrics(extracted_dir: Path) -> list[dict]:
     report "no lyrics" on those PSARCs, which would in turn make the
     --auto-lyrics flag transcribe over the real authored lyrics. The
     lib version also handles platform routing (PC vs Mac SNG keys)
-    and the lyrics_source provenance the manifest expects."""
-    from sloppak_convert import _parse_lyrics as _lib_parse_lyrics
-    return _lib_parse_lyrics(extracted_dir)
+    and returns the `lyrics_source` provenance the manifest expects."""
+    from sloppak_convert import _parse_lyrics_with_source as _lib
+    return _lib(extracted_dir)
 
 
 def _extract_cover(extracted_dir: Path, out_jpg: Path) -> bool:
@@ -195,10 +195,10 @@ def convert(psarc_path: Path, out_path: Path, as_dir: bool) -> Path:
         ]
 
         # Lyrics.
-        lyrics = _parse_lyrics(tmp_extract)
+        lyrics, lyrics_source = _parse_lyrics_with_source(tmp_extract)
         lyrics_rel = None
         if lyrics:
-            print(f"[*] Writing {len(lyrics)} lyric tokens")
+            print(f"[*] Writing {len(lyrics)} lyric tokens (source: {lyrics_source})")
             (work_dir / "lyrics.json").write_text(
                 json.dumps(lyrics, separators=(",", ":")), encoding="utf-8"
             )
@@ -224,6 +224,8 @@ def convert(psarc_path: Path, out_path: Path, as_dir: bool) -> Path:
         manifest["arrangements"] = arr_manifest
         if lyrics_rel:
             manifest["lyrics"] = lyrics_rel
+            if lyrics_source:
+                manifest["lyrics_source"] = lyrics_source
 
         (work_dir / "manifest.yaml").write_text(
             yaml.safe_dump(manifest, sort_keys=False, allow_unicode=True),
