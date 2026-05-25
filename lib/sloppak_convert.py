@@ -1136,6 +1136,11 @@ def split_sloppak_stems(
                 if f.is_file():
                     zf.write(f, f.relative_to(work).as_posix())
         tmp_out.replace(sloppak_path)
+        # Final flush so the caller's progress bar reaches 100% for the
+        # zip-form path too — the dir-form branch already terminates at
+        # base_frac+span_frac inside _split_in_dir.
+        _progress(progress_cb, base_frac + span_frac, "done",
+                  f"Repacked {sloppak_path.name}")
 
 
 # ── Retroactive lyric generation on existing sloppaks ───────────────────────
