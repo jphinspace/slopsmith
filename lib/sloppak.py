@@ -224,6 +224,11 @@ def load_song(
         if lyr_path.exists():
             try:
                 song.lyrics = json.loads(lyr_path.read_text(encoding="utf-8"))
+                # Provenance — populated by the converter (xml/sng), the
+                # WhisperX fallback (whisperx), or hand-edits (user). Falls
+                # back to "xml" on legacy sloppaks per the spec's
+                # backward-compatibility note.
+                song.lyrics_source = str(manifest.get("lyrics_source") or "xml")
             except Exception as e:
                 log.debug("sloppak: failed to parse lyrics %r: %s", lyrics_rel, e)
 

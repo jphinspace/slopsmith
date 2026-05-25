@@ -250,6 +250,13 @@ def convert(psarc_path: Path, out_path: Path, as_dir: bool) -> Path:
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+def _progress_printer(frac: float, stage: str, msg: str) -> None:
+    sys.stdout.write(f"\r[{stage:>12}] {int(frac * 100):3d}%  {msg:<60}")
+    sys.stdout.flush()
+    if frac >= 1.0:
+        sys.stdout.write("\n")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Convert a PSARC to a .sloppak")
     ap.add_argument("psarc", type=Path, help="input .psarc file")
@@ -257,6 +264,10 @@ def main() -> int:
                     help="output path (default: alongside the PSARC)")
     ap.add_argument("--dir", action="store_true",
                     help="emit directory form instead of a zip")
+    ap.add_argument("--auto-lyrics", dest="auto_lyrics", action="store_true",
+                    help="after conversion, run Demucs + WhisperX to generate "
+                         "lyrics.json from the vocal stem (skipped when the PSARC "
+                         "already shipped lyrics). Adds the split-stems pass too.")
     args = ap.parse_args()
 
     psarc = args.psarc
@@ -278,6 +289,23 @@ def main() -> int:
         return 1
 
     print(f"[✓] Wrote {result}")
+
+    if args.auto_lyrics:
+        # Delegate to the lib's split path with transcribe_lyrics=True.
+        # The lib's _maybe_transcribe_lyrics handles the "lyrics already
+        # present" gate, so PSARCs that shipped vocals XML/SNG won't get
+        # overwritten by the auto-transcription.
+        from sloppak_convert import split_sloppak_stems  # noqa: WPS433
+        print("[*] Splitting stems + transcribing vocals")
+        try:
+            split_sloppak_stems(
+                result, progress_cb=_progress_printer, transcribe_lyrics=True,
+            )
+        except Exception as e:
+            print(f"\n[warn] --auto-lyrics step failed: {e}", file=sys.stderr)
+            # Don't fail the whole convert — the sloppak itself is valid.
+            return 0
+
     return 0
 
 

@@ -523,7 +523,7 @@ The highway WebSocket at `/ws/highway/{filename}?arrangement={index}` streams th
 | `sections` | `{ type, data: [{ time, name }] }` | Named sections (Intro, Verse, Chorus, etc.) |
 | `anchors` | `{ type, data: [{ time, fret, width }] }` | Fret zoom anchors |
 | `chord_templates` | `{ type, data: [{ name, frets: [6] }] }` | Named chord shapes |
-| `lyrics` | `{ type, data: [{ w, t, d }] }` | Syllables: `w`=word, `t`=time, `d`=duration. `-` joins to previous, `+` = line break |
+| `lyrics` | `{ type, data: [{ w, t, d }], source }` | Syllables: `w`=word, `t`=time, `d`=duration. `-` joins to previous, `+` = line break. `source` is one of `"xml"`, `"sng"`, `"whisperx"`, `"user"` — UI can use it to render an "auto-transcribed" badge for `whisperx`. Absent on legacy sloppaks; treat as `"xml"` |
 | `tone_changes` | `{ type: 'tone_changes', base, data: [{ time, name }] }` | Optional — tone change events relative to the arrangement base tone; only sent if tones were found |
 | `notes` | `{ type, data: [{ t, s, f, sus, ho, po, sl, bn, ... }] }` | Single notes |
 | `chords` | `{ type, data: [{ t, notes: [{ s, f, sus, ... }] }] }` | Chord events |

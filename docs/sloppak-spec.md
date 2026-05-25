@@ -77,6 +77,7 @@ Full set of currently-recognized top-level keys:
 | `arrangements` | list | yes | Playable arrangements (see §2.1) |
 | `stems` | list | yes | Audio stems (see §2.2) |
 | `lyrics` | string | no | Path to lyrics JSON |
+| `lyrics_source` | string | no | Where the lyrics came from: `xml` (Rocksmith vocals.xml), `sng` (encrypted Rocksmith vocals.sng), `whisperx` (auto-transcribed), or `user` (hand-edited). Absent on legacy sloppaks — readers should treat missing as `xml` |
 | `cover` | string | no | Path to cover image |
 
 Unknown keys are **silently ignored** by the loader. This is deliberate — it's the extensibility hook (see §5).
@@ -134,6 +135,8 @@ If present, points at a JSON file containing a flat list of syllable objects:
 | `t` | Time in seconds |
 | `d` | Duration in seconds |
 | `w` | Syllable text. `-` suffix joins to next word; `+` is a line break sentinel |
+
+When lyrics are present, the optional top-level `lyrics_source` key records where they came from. The PSARC→sloppak converter sets it to `xml` or `sng` based on which Rocksmith source it parsed; the WhisperX auto-transcription fallback (`scripts/transcribe_lyrics.py`, or `--auto-lyrics` on the convert / split scripts) sets it to `whisperx`. Hand-edited lyrics should bump it to `user` so UI consumers can render a different badge (or no badge) than for machine-generated lyrics. The key is absent on sloppaks produced before this field existed — readers should treat missing as `xml` for backward compatibility.
 
 ---
 

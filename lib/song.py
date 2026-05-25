@@ -152,6 +152,12 @@ class Song:
     audio_path: str = ""
     # Optional lyrics, one entry per syllable: {"t": float, "d": float, "w": str}
     lyrics: list[dict] = field(default_factory=list)
+    # Provenance of the lyrics, when present. One of "xml" | "sng" | "whisperx" |
+    # "user" — surfaces in the highway WS payload so the UI can render a badge
+    # (e.g. "auto-transcribed — may be inaccurate" for whisperx). Empty string
+    # on legacy sloppaks / sources that don't track provenance; consumers
+    # default missing to "xml".
+    lyrics_source: str = ""
 
 
 # ── Wire format serialization (shared between highway_ws and sloppak loader) ──

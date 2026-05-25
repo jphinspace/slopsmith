@@ -95,7 +95,12 @@ def _wem_to_ogg(wem_path: str, out_ogg: Path) -> None:
             )
 
 
-def _parse_lyrics(extracted_dir: Path) -> list[dict]:
+def _parse_lyrics_with_source(extracted_dir: Path) -> tuple[list[dict], str | None]:
+    """Return (lyrics, source) where source is "xml" | "sng" | None.
+
+    Caller uses `source` to populate the manifest's `lyrics_source`
+    field so downstream UI can distinguish Rocksmith-authored lyrics
+    from later auto-transcribed ones (see WhisperX fallback path)."""
     # Try vocals XML first (CDLC and some official DLC)
     for xml_path in sorted(extracted_dir.rglob("*.xml")):
         try:
@@ -105,14 +110,17 @@ def _parse_lyrics(extracted_dir: Path) -> list[dict]:
             continue
         if root.tag != "vocals":
             continue
-        return [
-            {
-                "t": round(float(v.get("time", "0")), 3),
-                "d": round(float(v.get("length", "0")), 3),
-                "w": v.get("lyric", ""),
-            }
-            for v in root.findall("vocal")
-        ]
+        return (
+            [
+                {
+                    "t": round(float(v.get("time", "0")), 3),
+                    "d": round(float(v.get("length", "0")), 3),
+                    "w": v.get("lyric", ""),
+                }
+                for v in root.findall("vocal")
+            ],
+            "xml",
+        )
     # Fall back to vocals SNG (official DLC ships SNG-only)
     try:
         from sng_vocals import parse_vocals_sng
@@ -120,10 +128,15 @@ def _parse_lyrics(extracted_dir: Path) -> list[dict]:
             plat = "mac" if "/macos/" in str(sng_path).replace("\\", "/").lower() else "pc"
             lyrics = parse_vocals_sng(str(sng_path), plat)
             if lyrics:
-                return lyrics
+                return (lyrics, "sng")
     except ImportError:
         pass
-    return []
+    return ([], None)
+
+
+def _parse_lyrics(extracted_dir: Path) -> list[dict]:
+    lyrics, _ = _parse_lyrics_with_source(extracted_dir)
+    return lyrics
 
 
 def _extract_cover(extracted_dir: Path, out_jpg: Path) -> bool:
@@ -407,7 +420,7 @@ def convert_psarc_to_sloppak(
 
         stems_manifest = [{"id": "full", "file": "stems/full.ogg", "default": "on"}]
 
-        lyrics = _parse_lyrics(tmp_extract)
+        lyrics, lyrics_source = _parse_lyrics_with_source(tmp_extract)
         lyrics_rel = None
         if lyrics:
             (work_dir / "lyrics.json").write_text(
@@ -432,6 +445,8 @@ def convert_psarc_to_sloppak(
         manifest["arrangements"] = arr_manifest
         if lyrics_rel:
             manifest["lyrics"] = lyrics_rel
+            if lyrics_source:
+                manifest["lyrics_source"] = lyrics_source
         (work_dir / "manifest.yaml").write_text(
             yaml.safe_dump(manifest, sort_keys=False, allow_unicode=True),
             encoding="utf-8",
@@ -526,20 +541,63 @@ def demucs_available() -> bool:
         return False
 
 
-def _get_demucs_server_url() -> str | None:
-    """Get the configured remote demucs server URL, if any."""
+def _load_converter_config() -> dict:
+    """Read `${CONFIG_DIR}/config.json` and return the parsed dict.
+
+    Returns `{}` when the file is missing or malformed — same graceful
+    fallback the legacy `_get_demucs_server_url()` relied on. Shared by
+    `_get_demucs_server_url()` and `_get_whisperx_config()` so both
+    helpers see a consistent view of converter-wide settings."""
     config_dir = Path(os.environ.get("CONFIG_DIR", "/config"))
     config_file = config_dir / "config.json"
-    if config_file.exists():
-        try:
-            import json
-            cfg = json.loads(config_file.read_text())
-            url = cfg.get("demucs_server_url", "")
-            if url:
-                return url.rstrip("/")
-        except Exception as e:
-            log.debug("failed to read demucs_server_url from config: %s", e)
-    return None
+    if not config_file.exists():
+        return {}
+    try:
+        return json.loads(config_file.read_text()) or {}
+    except Exception as e:
+        log.debug("failed to read converter config: %s", e)
+        return {}
+
+
+def _get_demucs_server_url() -> str | None:
+    """Get the configured remote demucs server URL, if any."""
+    url = _load_converter_config().get("demucs_server_url", "") or ""
+    return url.rstrip("/") or None
+
+
+def _get_whisperx_config() -> dict:
+    """Return the WhisperX sub-config from `${CONFIG_DIR}/config.json`.
+
+    Shape (all keys optional, defaults applied here):
+
+        {
+          "enabled": bool,            # default False — opt-in
+          "model_size": str,          # default "medium"
+          "server_url": str | None,   # default None → fall back to demucs_server_url
+          "api_key": str | None,
+          "language": str | None,     # ISO code; None = autodetect
+          "min_word_score": float,    # default 0.35
+          "silence_rms_threshold": float,  # default 0.005
+        }
+
+    When `server_url` is unset, callers fall through to
+    `_get_demucs_server_url()` — Byron's reference demucs-server
+    already hosts WhisperX at `/align`, so the same URL serves both
+    workloads for the common single-box deployment."""
+    cfg = _load_converter_config()
+    raw = cfg.get("whisperx") or {}
+    server_url = raw.get("server_url") or None
+    if isinstance(server_url, str):
+        server_url = server_url.rstrip("/") or None
+    return {
+        "enabled": bool(raw.get("enabled", False)),
+        "model_size": str(raw.get("model_size") or "medium"),
+        "server_url": server_url,
+        "api_key": raw.get("api_key") or None,
+        "language": raw.get("language") or None,
+        "min_word_score": float(raw.get("min_word_score", 0.35)),
+        "silence_rms_threshold": float(raw.get("silence_rms_threshold", 0.005)),
+    }
 
 
 def _run_demucs_remote(full_ogg: Path, out_dir: Path, model: str) -> Path:
@@ -740,12 +798,142 @@ def _rewrite_stems_manifest(source_dir: Path, new_stems: list[dict]) -> None:
     )
 
 
+def _rewrite_lyrics_manifest(source_dir: Path, lyrics_rel: str, source: str) -> None:
+    """Set `lyrics` + `lyrics_source` on the sloppak's manifest in-place.
+
+    Used by the WhisperX fallback path after writing a fresh
+    `lyrics.json`. Caller is responsible for having written the file
+    at `source_dir / lyrics_rel` already."""
+    mf = source_dir / "manifest.yaml"
+    if not mf.exists():
+        mf = source_dir / "manifest.yml"
+    data = yaml.safe_load(mf.read_text(encoding="utf-8")) or {}
+    data["lyrics"] = lyrics_rel
+    data["lyrics_source"] = source
+    mf.write_text(
+        yaml.safe_dump(data, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+
+
+def _maybe_transcribe_lyrics(
+    source_dir: Path,
+    produced_stems: list[dict],
+    *,
+    enabled: bool,
+    force: bool = False,
+    progress_cb: ProgressCB = None,
+    base_frac: float = 0.0,
+    span_frac: float = 0.1,
+) -> bool:
+    """Run WhisperX over the freshly-split vocals stem when conditions hold.
+
+    Gates, evaluated in order — any failure short-circuits and the
+    surrounding split must NOT fail:
+
+      1. `enabled` is True (explicit per-invocation override, or
+         `whisperx.enabled` from converter config).
+      2. The Demucs split produced a `vocals.ogg` stem.
+      3. Existing `lyrics.json` is absent (fallback-only semantics).
+         `force=True` bypasses this — used by the retroactive CLI
+         to overwrite Rocksmith lyrics on user request.
+      4. The vocals stem has signal above the configured RMS threshold
+         (skip instrumentals — Whisper hallucinates on near-silent
+         input).
+
+    Returns True when lyrics were written, False otherwise. All
+    exceptions are caught and logged at WARNING — the caller treats
+    transcription as best-effort."""
+    if not enabled:
+        return False
+    if not any(s.get("id") == "vocals" for s in produced_stems):
+        log.debug("_maybe_transcribe_lyrics: no vocals stem in produced output")
+        return False
+    vocals_path = source_dir / "stems" / "vocals.ogg"
+    if not vocals_path.exists():
+        log.debug("_maybe_transcribe_lyrics: %s missing despite manifest entry", vocals_path)
+        return False
+    lyrics_path = source_dir / "lyrics.json"
+    if lyrics_path.exists() and not force:
+        log.info("_maybe_transcribe_lyrics: %s already has lyrics, skipping (use force=True to override)",
+                 source_dir.name)
+        return False
+
+    cfg = _get_whisperx_config()
+
+    try:
+        from lyrics_transcribe import (
+            vocals_has_signal,
+            transcribe_vocals_remote,
+            transcribe_vocals_local,
+            whisperx_available,
+        )
+    except ImportError as e:
+        log.warning("_maybe_transcribe_lyrics: lyrics_transcribe import failed: %s", e)
+        return False
+
+    if not vocals_has_signal(vocals_path, threshold=cfg["silence_rms_threshold"]):
+        log.info("_maybe_transcribe_lyrics: %s vocals below silence threshold — skipping (likely instrumental)",
+                 source_dir.name)
+        return False
+
+    # WhisperX server URL precedence: explicit `whisperx.server_url`
+    # wins, else fall back to the demucs server (Byron's reference
+    # server hosts WhisperX at /align too), else local in-process.
+    server_url = cfg["server_url"] or _get_demucs_server_url()
+
+    _progress(progress_cb, base_frac + span_frac * 0.10, "transcribing",
+              "Transcribing vocals" + (f" (remote: {server_url})" if server_url else " (local)"))
+
+    def _inner_cb(frac: float, stage: str, msg: str) -> None:
+        # Re-scale the transcriber's 0..1 progress into the slice this
+        # step owns in the outer convert/split pipeline.
+        _progress(progress_cb, base_frac + span_frac * (0.10 + 0.80 * frac), stage, msg)
+
+    try:
+        if server_url:
+            lyrics = transcribe_vocals_remote(
+                vocals_path, server_url,
+                language=cfg["language"],
+                api_key=cfg["api_key"],
+                progress_cb=_inner_cb,
+            )
+        else:
+            if not whisperx_available():
+                log.warning("_maybe_transcribe_lyrics: whisperx not installed and no server configured — "
+                            "skipping. Install whisperx or set whisperx.server_url / demucs_server_url.")
+                return False
+            lyrics = transcribe_vocals_local(
+                vocals_path,
+                model_size=cfg["model_size"],
+                language=cfg["language"],
+                min_word_score=cfg["min_word_score"],
+                progress_cb=_inner_cb,
+            )
+    except Exception as e:
+        log.warning("_maybe_transcribe_lyrics: transcription failed for %s: %s",
+                    source_dir.name, e, exc_info=True)
+        return False
+
+    if not lyrics:
+        log.info("_maybe_transcribe_lyrics: %s produced no lyrics after filtering", source_dir.name)
+        return False
+
+    lyrics_path.write_text(json.dumps(lyrics, separators=(",", ":")), encoding="utf-8")
+    _rewrite_lyrics_manifest(source_dir, "lyrics.json", "whisperx")
+    _progress(progress_cb, base_frac + span_frac, "transcribing",
+              f"Wrote {len(lyrics)} lyric tokens")
+    log.info("_maybe_transcribe_lyrics: wrote %d tokens to %s", len(lyrics), lyrics_path)
+    return True
+
+
 def _split_in_dir(
     source_dir: Path,
     model: str,
     progress_cb: ProgressCB,
     base_frac: float,
     span_frac: float,
+    transcribe_lyrics: bool | None = None,
 ) -> None:
     full_ogg = source_dir / "stems" / "full.ogg"
     if not full_ogg.exists():
@@ -757,11 +945,19 @@ def _split_in_dir(
     remote_url = _get_demucs_server_url()
     use_remote = remote_url is not None
 
+    # Reserve the tail of the progress budget for the optional WhisperX
+    # transcription step. Demucs gets the bulk (0..split_span); transcription
+    # owns the rest (split_span..1.0). When transcription is disabled the
+    # entire span is consumed by splitting.
+    wx_enabled = bool(transcribe_lyrics if transcribe_lyrics is not None
+                      else _get_whisperx_config()["enabled"])
+    split_span = span_frac * (0.85 if wx_enabled else 1.0)
+
     if use_remote:
-        _progress(progress_cb, base_frac + span_frac * 0.05, "splitting",
+        _progress(progress_cb, base_frac + split_span * 0.05, "splitting",
                   f"Sending to Demucs server ({remote_url})")
     else:
-        _progress(progress_cb, base_frac + span_frac * 0.05, "splitting",
+        _progress(progress_cb, base_frac + split_span * 0.05, "splitting",
                   f"Running Demucs locally ({model})")
 
     with tempfile.TemporaryDirectory(prefix="s2p_split_") as td:
@@ -777,7 +973,7 @@ def _split_in_dir(
         else:
             result_dir = _run_demucs(full_ogg, Path(td), model)
 
-        _progress(progress_cb, base_frac + span_frac * 0.85, "splitting",
+        _progress(progress_cb, base_frac + split_span * 0.85, "splitting",
                   "Encoding split stems")
         produced: list[dict] = []
         stems_dir = source_dir / "stems"
@@ -797,6 +993,22 @@ def _split_in_dir(
             return (len(_STEM_ORDER), s["id"])
     produced.sort(key=_order_key)
 
+    # Optional WhisperX transcription — runs after stems are encoded
+    # but before `full.ogg` is removed (the order doesn't strictly
+    # matter for the vocals stem, which is independent, but keeping
+    # `full.ogg` around through the transcription call gives a fallback
+    # input if a future variant ever needs the mixed track). Wrapped
+    # internally so failures don't break the split.
+    if wx_enabled:
+        _maybe_transcribe_lyrics(
+            source_dir,
+            produced,
+            enabled=True,
+            progress_cb=progress_cb,
+            base_frac=base_frac + split_span,
+            span_frac=span_frac - split_span,
+        )
+
     full_ogg.unlink(missing_ok=True)
     _rewrite_stems_manifest(source_dir, produced)
 
@@ -807,10 +1019,19 @@ def split_sloppak_stems(
     progress_cb: ProgressCB = None,
     base_frac: float = 0.0,
     span_frac: float = 1.0,
+    transcribe_lyrics: bool | None = None,
 ) -> None:
-    """Split a sloppak's stems/full.ogg into per-instrument stems via Demucs."""
+    """Split a sloppak's stems/full.ogg into per-instrument stems via Demucs.
+
+    `transcribe_lyrics` controls the optional WhisperX lyric fallback
+    that runs after stems are split. `None` (default) defers to the
+    `whisperx.enabled` flag in the converter config; `True` / `False`
+    is an explicit per-invocation override. Transcription only fires
+    when Demucs produced a `vocals.ogg` and the sloppak has no
+    existing `lyrics.json`."""
     if sloppak_path.is_dir():
-        _split_in_dir(sloppak_path, model, progress_cb, base_frac, span_frac)
+        _split_in_dir(sloppak_path, model, progress_cb, base_frac, span_frac,
+                      transcribe_lyrics=transcribe_lyrics)
         return
 
     # Zip form: unpack, split, re-zip atomically.
@@ -820,7 +1041,8 @@ def split_sloppak_stems(
         with zipfile.ZipFile(str(sloppak_path), "r") as zf:
             zf.extractall(work)
 
-        _split_in_dir(work, model, progress_cb, base_frac, span_frac * 0.9)
+        _split_in_dir(work, model, progress_cb, base_frac, span_frac * 0.9,
+                      transcribe_lyrics=transcribe_lyrics)
 
         _progress(progress_cb, base_frac + span_frac * 0.95, "packing",
                   "Repacking sloppak")
@@ -830,3 +1052,124 @@ def split_sloppak_stems(
                 if f.is_file():
                     zf.write(f, f.relative_to(work).as_posix())
         tmp_out.replace(sloppak_path)
+
+
+# ── Retroactive lyric generation on existing sloppaks ───────────────────────
+
+def transcribe_existing_sloppak(
+    sloppak_path: Path,
+    *,
+    force: bool = False,
+    model: str = "htdemucs_6s",
+    progress_cb: ProgressCB = None,
+) -> bool:
+    """Add WhisperX-transcribed lyrics to an existing sloppak.
+
+    Three input states are handled:
+
+      1. Sloppak already has `stems/vocals.ogg` (previously split) —
+         transcribe directly, no Demucs cost. The common case for
+         users who ran the stems splitter without `transcribe_lyrics=True`.
+
+      2. Sloppak only has `stems/full.ogg` (never split) — delegate
+         to `split_sloppak_stems(transcribe_lyrics=True)`, which
+         Demucs-splits and transcribes in one pass. Leaves the other
+         stems in place (no `--vocals-only` discard mode in v1; users
+         who don't want stems can keep using the convert path with
+         no `--auto-lyrics`).
+
+      3. Sloppak already has `lyrics.json` — short-circuit unless
+         `force=True`. Mirrors the fallback-only semantics of the
+         split path; `force=True` is the escape hatch.
+
+    Returns True when new lyrics were written, False otherwise. Like
+    `_maybe_transcribe_lyrics`, exceptions inside the transcription
+    are logged + swallowed; only setup-level errors (missing sloppak,
+    missing audio) propagate.
+
+    Works on both directory-form and zip-form sloppaks. Zip-form is
+    unpacked to a temp dir, edited, re-zipped atomically (mirrors
+    `split_sloppak_stems`'s zip handling)."""
+    if not sloppak_path.exists():
+        raise FileNotFoundError(f"{sloppak_path} does not exist")
+
+    if sloppak_path.is_dir():
+        return _transcribe_existing_in_dir(
+            sloppak_path, force=force, model=model, progress_cb=progress_cb,
+            base_frac=0.0, span_frac=1.0,
+        )
+
+    # Zip form: unpack, edit, repack atomically.
+    with tempfile.TemporaryDirectory(prefix="s2p_lyrics_zip_") as td:
+        work = Path(td) / "sloppak"
+        work.mkdir()
+        with zipfile.ZipFile(str(sloppak_path), "r") as zf:
+            zf.extractall(work)
+
+        wrote = _transcribe_existing_in_dir(
+            work, force=force, model=model, progress_cb=progress_cb,
+            base_frac=0.0, span_frac=0.9,
+        )
+        if not wrote:
+            return False
+
+        _progress(progress_cb, 0.95, "packing", "Repacking sloppak")
+        tmp_out = sloppak_path.with_suffix(sloppak_path.suffix + ".tmp")
+        with zipfile.ZipFile(str(tmp_out), "w", zipfile.ZIP_DEFLATED) as zf:
+            for f in work.rglob("*"):
+                if f.is_file():
+                    zf.write(f, f.relative_to(work).as_posix())
+        tmp_out.replace(sloppak_path)
+        _progress(progress_cb, 1.0, "done", f"Wrote {sloppak_path.name}")
+        return True
+
+
+def _transcribe_existing_in_dir(
+    source_dir: Path,
+    *,
+    force: bool,
+    model: str,
+    progress_cb: ProgressCB,
+    base_frac: float,
+    span_frac: float,
+) -> bool:
+    """Per-directory helper for `transcribe_existing_sloppak`."""
+    lyrics_path = source_dir / "lyrics.json"
+    vocals_path = source_dir / "stems" / "vocals.ogg"
+    full_path = source_dir / "stems" / "full.ogg"
+
+    if lyrics_path.exists() and not force:
+        log.info("transcribe_existing_sloppak: %s already has lyrics.json (pass force=True to override)",
+                 source_dir.name)
+        return False
+
+    if vocals_path.exists():
+        # State 1: vocal stem already isolated. Synthesize a `produced`
+        # list with just vocals so `_maybe_transcribe_lyrics` recognizes
+        # the stem is available — manifest is not rewritten in this path.
+        produced = [{"id": "vocals", "file": "stems/vocals.ogg", "default": "on"}]
+        return _maybe_transcribe_lyrics(
+            source_dir, produced,
+            enabled=True, force=force,
+            progress_cb=progress_cb,
+            base_frac=base_frac, span_frac=span_frac,
+        )
+
+    if not full_path.exists():
+        raise FileNotFoundError(
+            f"{source_dir} has neither stems/vocals.ogg nor stems/full.ogg — "
+            "nothing to transcribe."
+        )
+
+    # State 2: only a full mix exists. Delegate to the split path so
+    # Demucs produces vocals.ogg and the same transcription gate fires
+    # at the end. Passing `force=True` is honored by _maybe_transcribe_lyrics
+    # via the existing lyrics.json gate; the split path itself doesn't
+    # forward force, but we already cleared the lyrics_path check above
+    # when force=True is set, and otherwise the existing-lyrics gate
+    # would have short-circuited us earlier.
+    if force and lyrics_path.exists():
+        lyrics_path.unlink(missing_ok=True)
+    _split_in_dir(source_dir, model, progress_cb, base_frac, span_frac,
+                  transcribe_lyrics=True)
+    return lyrics_path.exists()
