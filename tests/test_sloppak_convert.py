@@ -878,6 +878,43 @@ def test_load_lyrics_for_pitch_filters_non_numeric_t_or_d(tmp_path):
     ]
 
 
+def test_maybe_transcribe_lyrics_runs_pitch_when_whisperx_disabled_and_lyrics_exist(tmp_path, monkeypatch):
+    """The structural case from Copilot round 6: a user who has
+    pitch_extraction.enabled=True but whisperx.enabled=False (or a
+    convert that explicitly disables transcription) should still get
+    pitch over their existing on-disk lyrics. Previously the
+    `if not enabled: return False` short-circuit at the top of
+    _maybe_transcribe_lyrics killed the pitch path before it could
+    fire."""
+    src = _make_sloppak_with_vocals(tmp_path)
+    existing = src / "lyrics.json"
+    existing.write_text(
+        _json.dumps([{"t": 0.0, "d": 0.5, "w": "hi"}]), encoding="utf-8"
+    )
+    mf = _yaml.safe_load((src / "manifest.yaml").read_text(encoding="utf-8"))
+    mf["lyrics"] = "lyrics.json"
+    (src / "manifest.yaml").write_text(_yaml.safe_dump(mf), encoding="utf-8")
+
+    _patch_pitch_config(monkeypatch)
+    received = {}
+    import vocal_pitch
+    def _stub(*args, **kwargs):
+        received["lyrics"] = args[1]
+        return [{"t": 0.0, "d": 0.5, "midi": 64}]
+    monkeypatch.setattr(vocal_pitch, "extract_pitch_remote", _stub)
+
+    out = sloppak_convert._maybe_transcribe_lyrics(
+        src,
+        [{"id": "vocals", "file": "stems/vocals.ogg"}],
+        # WhisperX explicitly off — the wx_enabled=False path used to
+        # return immediately without touching pitch.
+        enabled=False,
+    )
+    assert out is False
+    assert received.get("lyrics") == [{"t": 0.0, "d": 0.5, "w": "hi"}]
+    assert (src / "vocal_pitch.json").exists()
+
+
 def test_maybe_transcribe_lyrics_runs_pitch_when_lyrics_already_exist(tmp_path, monkeypatch):
     """When a sloppak ships with lyrics (PSARC xml/sng or hand-authored),
     WhisperX skips — but the pitch path should STILL run since the

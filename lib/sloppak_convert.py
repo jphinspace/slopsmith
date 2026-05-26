@@ -1075,7 +1075,32 @@ def _maybe_transcribe_lyrics(
         return False
 
     if not enabled:
-        return False  # not reserving a progress slice when disabled
+        # WhisperX disabled, but pitch extraction may still be enabled
+        # AND find existing lyrics on disk to work with — don't bail
+        # before that flow gets a chance. Note: we only reach this
+        # branch when the outer caller actually decided to reserve a
+        # slice for us (either wx_enabled OR pitch_enabled in
+        # _split_in_dir), so flushing to the slice top on exit is
+        # correct either way.
+        existing = _existing_lyrics_path(source_dir)
+        if existing is not None:
+            vocals_path = source_dir / "stems" / "vocals.ogg"
+            if vocals_path.exists():
+                existing_lyrics = _load_lyrics_for_pitch(existing)
+                if existing_lyrics:
+                    _maybe_extract_pitch(
+                        source_dir, existing_lyrics, vocals_path,
+                        progress_cb=progress_cb,
+                        base_frac=base_frac,
+                        span_frac=span_frac,
+                    )
+                    return False
+        # No pitch hand-off happened — flush the slice the caller
+        # reserved for us so the progress bar still reaches the
+        # promised boundary.
+        _progress(progress_cb, base_frac + span_frac, "transcribing",
+                  "Lyric/pitch pass skipped (transcription disabled)")
+        return False
     if not any(s.get("id") == "vocals" for s in produced_stems):
         log.debug("_maybe_transcribe_lyrics: no vocals stem in produced output")
         return _skip("No vocals stem to transcribe")
@@ -1431,12 +1456,18 @@ def _split_in_dir(
     use_remote = remote_url is not None
 
     # Reserve the tail of the progress budget for the optional WhisperX
-    # transcription step. Demucs gets the bulk (0..split_span); transcription
-    # owns the rest (split_span..1.0). When transcription is disabled the
-    # entire span is consumed by splitting.
+    # transcription + pitch-extraction steps. Demucs gets the bulk
+    # (0..split_span); the lyric/pitch pass owns the rest
+    # (split_span..1.0). The slice is reserved when EITHER WhisperX OR
+    # pitch extraction is enabled — pitch alone is enough to need the
+    # tail because it runs on existing lyrics even when WhisperX is
+    # disabled (the "Lyrics already present" short-circuit inside
+    # _maybe_transcribe_lyrics handles the hand-off).
     wx_enabled = bool(transcribe_lyrics if transcribe_lyrics is not None
                       else _get_whisperx_config()["enabled"])
-    split_span = span_frac * (0.85 if wx_enabled else 1.0)
+    pitch_enabled = bool(_get_pitch_config()["enabled"])
+    needs_post_split = wx_enabled or pitch_enabled
+    split_span = span_frac * (0.85 if needs_post_split else 1.0)
 
     if use_remote:
         _progress(progress_cb, base_frac + split_span * 0.05, "splitting",
@@ -1478,17 +1509,20 @@ def _split_in_dir(
             return (len(_STEM_ORDER), s["id"])
     produced.sort(key=_order_key)
 
-    # Optional WhisperX transcription — runs after stems are encoded
-    # but before `full.ogg` is removed (the order doesn't strictly
-    # matter for the vocals stem, which is independent, but keeping
-    # `full.ogg` around through the transcription call gives a fallback
-    # input if a future variant ever needs the mixed track). Wrapped
-    # internally so failures don't break the split.
-    if wx_enabled:
+    # Optional WhisperX transcription + pitch extraction — runs after
+    # stems are encoded but before `full.ogg` is removed (the order
+    # doesn't strictly matter for the vocals stem, which is
+    # independent, but keeping `full.ogg` around through the
+    # transcription call gives a fallback input if a future variant
+    # ever needs the mixed track). Wrapped internally so failures
+    # don't break the split. The `enabled` argument controls only
+    # WhisperX; _maybe_transcribe_lyrics still attempts pitch
+    # extraction on existing lyrics when wx is off but pitch is on.
+    if needs_post_split:
         _maybe_transcribe_lyrics(
             source_dir,
             produced,
-            enabled=True,
+            enabled=wx_enabled,
             progress_cb=progress_cb,
             base_frac=base_frac + split_span,
             span_frac=span_frac - split_span,
