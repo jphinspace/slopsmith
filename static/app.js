@@ -7189,6 +7189,19 @@ async function bootstrapPluginsAndUi() {
     // Reuse the plugin list loadPlugins just fetched — no need to
     // round-trip /api/plugins a second time.
     _populateVizPicker(plugins);
+    // Alpha-build heads-up banner — only revealed when the running version
+    // string contains "alpha" (case-insensitive). Stays hidden on stable,
+    // beta, RC, or any other channel. The banner element lives in the
+    // library-section markup; toggling the `hidden` Tailwind utility is the
+    // entire surface area, so a test harness can sandbox this against a
+    // minimal document stub.
+    function _updateAlphaWarningBanner(version) {
+        const banner = document.getElementById('alpha-warning-banner');
+        if (!banner) return;
+        const isAlpha = typeof version === 'string'
+            && version.toLowerCase().includes('alpha');
+        banner.classList.toggle('hidden', !isAlpha);
+    }
     fetch('/api/version')
         .then(r => { if (!r.ok) throw new Error(); return r.json(); })
         .then(d => {
@@ -7199,6 +7212,7 @@ async function bootstrapPluginsAndUi() {
                 const aboutEl = document.getElementById('app-version-about');
                 if (aboutEl) aboutEl.textContent = 'v' + v;
             }
+            _updateAlphaWarningBanner(v);
             // Defense-in-depth: server validates the env-var-supplied URLs,
             // but the About <a href> values are configurable so the UI also
             // rejects anything that isn't http(s) with a non-empty hostname.
