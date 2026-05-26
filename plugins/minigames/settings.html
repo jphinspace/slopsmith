@@ -1,0 +1,41 @@
+<div class="space-y-6">
+  <div>
+    <h3 class="text-lg font-semibold text-white mb-1">Profile</h3>
+    <p class="text-sm text-gray-400 mb-3">
+      Your XP, unlocks, and run history are stored locally under
+      <code>&lt;config_dir&gt;/minigames/</code> and round-trip through
+      the global settings export.
+    </p>
+    <button id="mg-settings-reset" type="button"
+            class="px-3 py-2 rounded bg-red-600/80 hover:bg-red-500 text-white text-sm">
+      Reset profile + history
+    </button>
+    <span id="mg-settings-reset-status" class="ml-3 text-xs text-gray-400"
+          role="status" aria-live="polite" aria-atomic="true"></span>
+  </div>
+</div>
+
+<script>
+  (function () {
+    const btn    = document.getElementById('mg-settings-reset');
+    const status = document.getElementById('mg-settings-reset-status');
+    if (!btn || !status) return;
+    btn.addEventListener('click', async () => {
+      if (!confirm('Wipe all minigame XP, unlocks, and run history? This cannot be undone.')) return;
+      if (!window.slopsmithMinigames?.resetProfile) {
+        status.textContent = 'Minigames SDK not loaded — reload the page and try again.';
+        return;
+      }
+      btn.disabled = true;
+      status.textContent = 'Wiping…';
+      try {
+        await window.slopsmithMinigames.resetProfile();
+        status.textContent = 'Profile reset.';
+      } catch (e) {
+        status.textContent = 'Failed: ' + String(e?.message || e);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  })();
+</script>

@@ -1,0 +1,130 @@
+<!-- Inline critical styles: the plugin loader does not inject style.css
+     automatically, so rules that can't be expressed as Tailwind classes
+     are inlined here to ensure they're applied when screen.html is
+     injected via innerHTML. -->
+<style>
+  #mg-stage-body > .mg-game-root { position: absolute; inset: 0; }
+  .mg-pitch-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: rgb(107 114 128); margin-right: 6px; vertical-align: middle; }
+  .mg-pitch-dot.live { background: rgb(74 222 128); box-shadow: 0 0 8px rgba(74,222,128,0.6); }
+</style>
+
+<div id="mg-root" class="max-w-5xl mx-auto px-6 pt-24 pb-16">
+
+  <!-- Header + profile strip -->
+  <div class="flex items-end justify-between mb-8">
+    <div>
+      <h1 class="text-4xl font-bold text-white">Minigames</h1>
+      <p class="text-sm text-gray-400 mt-1">Standalone games that share your guitar input.</p>
+    </div>
+    <div id="mg-profile-strip" class="flex items-center gap-4">
+      <div class="text-right">
+        <div class="text-xs uppercase tracking-widest text-gray-500">Level</div>
+        <div id="mg-profile-level" class="text-2xl font-bold text-white">1</div>
+      </div>
+      <div class="w-48">
+        <div class="flex items-center justify-between mb-1 text-xs">
+          <span id="mg-profile-xp" class="text-gray-400">0 XP</span>
+          <span id="mg-profile-next" class="text-gray-500"></span>
+        </div>
+        <div class="h-2 bg-dark-700 rounded-full overflow-hidden">
+          <div id="mg-profile-bar"
+               class="h-full bg-accent rounded-full transition-all duration-500
+                      shadow-[0_0_8px_rgba(64,128,224,0.6)]"
+               style="width:0%"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tile grid — mirrors the library card layout for visual consistency -->
+  <div id="mg-grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-5"></div>
+
+  <!-- Empty state -->
+  <div id="mg-empty" class="hidden text-center py-24">
+    <div class="text-5xl mb-3">🎮</div>
+    <p class="text-gray-400">No minigames installed.</p>
+    <p class="text-gray-500 text-sm mt-1">
+      Install a plugin whose <code>plugin.json</code> declares a
+      <code>"minigame"</code> block to see it here.
+    </p>
+  </div>
+
+  <!-- In-game container — only visible while a minigame is running.
+       z-[60] sits above the Slopsmith navbar (z-50) so the game owns the
+       viewport during a run; the stage's own Quit button is the exit. -->
+  <div id="mg-stage" class="hidden fixed inset-0 z-[60] bg-black/95 flex flex-col"
+       role="region" aria-labelledby="mg-stage-title">
+    <div class="flex items-center justify-between px-6 py-3 border-b border-dark-700">
+      <div>
+        <div id="mg-stage-title" class="text-lg font-semibold text-white"></div>
+        <div id="mg-stage-instrument" class="text-xs text-gray-400 mt-0.5"></div>
+      </div>
+      <div class="flex items-center gap-3">
+        <div id="mg-stage-hud" class="text-sm text-gray-300"></div>
+        <button id="mg-stage-quit"
+                class="px-3 py-1.5 text-sm rounded bg-dark-700 hover:bg-dark-600 text-gray-200">
+          Quit
+        </button>
+      </div>
+    </div>
+    <div id="mg-stage-body" class="flex-1 relative overflow-hidden"></div>
+  </div>
+
+  <!-- Run summary modal -->
+  <div id="mg-summary" class="hidden fixed inset-0 z-[60] bg-black/70 flex items-center justify-center"
+       role="dialog" aria-modal="true" aria-labelledby="mg-summary-heading">
+    <div class="bg-dark-800 rounded-lg shadow-2xl p-8 w-full max-w-md mx-4">
+      <h2 id="mg-summary-heading" class="text-2xl font-bold text-white mb-1">Run complete</h2>
+      <p id="mg-summary-game" class="text-sm text-gray-400 mb-6"></p>
+
+      <div class="grid grid-cols-3 gap-4 mb-6 text-center">
+        <div>
+          <div class="text-xs uppercase tracking-widest text-gray-500">Score</div>
+          <div id="mg-summary-score" class="text-3xl font-bold text-white mt-1">0</div>
+        </div>
+        <div>
+          <div class="text-xs uppercase tracking-widest text-gray-500">XP gained</div>
+          <div id="mg-summary-xp" class="text-3xl font-bold text-accent-light mt-1">0</div>
+        </div>
+        <div>
+          <div class="text-xs uppercase tracking-widest text-gray-500">Best</div>
+          <div id="mg-summary-best" class="text-3xl font-bold text-white mt-1">0</div>
+        </div>
+      </div>
+
+      <div id="mg-summary-extra" class="text-sm text-gray-400 mb-6"></div>
+
+      <div class="flex justify-end gap-3">
+        <button id="mg-summary-close"
+                class="px-4 py-2 rounded bg-dark-700 hover:bg-dark-600 text-gray-200">
+          Close
+        </button>
+        <button id="mg-summary-again"
+                class="px-4 py-2 rounded bg-accent hover:bg-accent-light text-white">
+          Play again
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modifier picker (shown before a run starts) -->
+  <div id="mg-picker" class="hidden fixed inset-0 z-[60] bg-black/70 flex items-center justify-center"
+       role="dialog" aria-modal="true" aria-labelledby="mg-picker-title">
+    <div class="bg-dark-800 rounded-lg shadow-2xl p-8 w-full max-w-md mx-4">
+      <h2 id="mg-picker-title" class="text-2xl font-bold text-white mb-1"></h2>
+      <p  id="mg-picker-tagline" class="text-sm text-gray-400 mb-6"></p>
+      <div id="mg-picker-body" class="space-y-4 mb-6"></div>
+      <div class="flex justify-end gap-3">
+        <button id="mg-picker-cancel"
+                class="px-4 py-2 rounded bg-dark-700 hover:bg-dark-600 text-gray-200">
+          Cancel
+        </button>
+        <button id="mg-picker-start"
+                class="px-4 py-2 rounded bg-accent hover:bg-accent-light text-white">
+          Start
+        </button>
+      </div>
+    </div>
+  </div>
+
+</div>
