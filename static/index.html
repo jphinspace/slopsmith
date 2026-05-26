@@ -304,6 +304,15 @@
                             </select>
                         </div>
                         <div>
+                            <label class="text-sm font-medium text-gray-400 mb-2 block">Arrangement Names</label>
+                            <select id="arrangement-naming-mode"
+                                onchange="_onNamingModeChange(this.value)"
+                                class="bg-dark-700 border border-gray-800 rounded-xl px-3 py-2.5 text-sm text-gray-300 outline-none">
+                                <option value="smart">Smart (Lead, Alt. Lead, Rhythm, Bass…)</option>
+                                <option value="legacy">Legacy (Combo, Bass)</option>
+                            </select>
+                        </div>
+                        <div>
                             <label for="setting-av-offset" class="text-sm font-medium text-gray-400 mb-2 block">
                                 A/V Sync Offset: <span id="setting-av-offset-val">0</span> ms
                             </label>

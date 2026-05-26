@@ -122,6 +122,73 @@ def test_arrangement_lacks_bass(client, seeded):
     assert "a.psarc" in files
 
 
+# ── Arrangements axis — smart naming mode ───────────────────────────────────
+
+@pytest.fixture()
+def seeded_smart(server_mod):
+    """Rows that exercise the smart-mode filter branches in _build_where."""
+    # Row with explicit smart_name="Alt. Lead" — must match arrangements_has=Lead
+    # in smart mode (LIKE 'Alt. Lead%').
+    _put(server_mod, filename="alt.psarc", title="Alt", artist="Alt Band",
+         arrangements=[{"index": 0, "name": "Lead", "notes": 100,
+                        "smart_name": "Alt. Lead"}])
+    # Row with explicit smart_name="Bonus Rhythm".
+    _put(server_mod, filename="bonus.psarc", title="Bon", artist="Bon Band",
+         arrangements=[{"index": 0, "name": "Rhythm", "notes": 50,
+                        "smart_name": "Bonus Rhythm"}])
+    # Legacy-cached row WITHOUT smart_name key (json_type IS NULL):
+    # name="Combo" → must match arrangements_has=Lead via name fallback.
+    _put(server_mod, filename="combo-old.psarc", title="ComboOld", artist="X",
+         arrangements=[{"index": 0, "name": "Combo", "notes": 80}])
+    # Legacy-cached row WITHOUT smart_name where name="Bass 2" (load_song
+    # synthesises this for real_bass_22 when manifest data is missing):
+    # must match arrangements_has=Bass via the extras fallback.
+    _put(server_mod, filename="bass2-old.psarc", title="Bass2Old", artist="Z",
+         arrangements=[{"index": 0, "name": "Bass 2", "notes": 70}])
+    # Scanned ambiguous row with explicit smart_name=None (json_type='null'):
+    # name="Combo" must NOT match Lead in smart mode (suppress name-fallback).
+    _put(server_mod, filename="combo-ambig.psarc", title="ComboAmb", artist="Y",
+         arrangements=[{"index": 0, "name": "Combo", "notes": 90,
+                        "smart_name": None}])
+
+
+def test_smart_mode_matches_alt_lead(client, seeded_smart):
+    data = _get(client, arrangements_has="Lead", naming_mode="smart")
+    files = {s["filename"] for s in data["songs"]}
+    assert "alt.psarc" in files          # smart_name="Alt. Lead"
+    assert "combo-old.psarc" in files    # name-fallback (key absent)
+    assert "combo-ambig.psarc" not in files  # explicit null suppresses fallback
+    assert "bonus.psarc" not in files    # Bonus Rhythm not Lead
+
+
+def test_smart_mode_matches_bass_2_via_fallback(client, seeded_smart):
+    # Legacy cached row with name="Bass 2" must match arrangements_has=Bass
+    # in smart mode via the NULL-smart_name name-fallback extras.
+    data = _get(client, arrangements_has="Bass", naming_mode="smart")
+    files = {s["filename"] for s in data["songs"]}
+    assert "bass2-old.psarc" in files
+
+
+def test_smart_mode_combo_normalized_to_lead(client, seeded_smart):
+    # arrangements_has=Combo in smart mode must behave identically to Lead —
+    # the server normalizes the alias before building the SQL.
+    lead = _get(client, arrangements_has="Lead", naming_mode="smart")
+    combo = _get(client, arrangements_has="Combo", naming_mode="smart")
+    assert {s["filename"] for s in lead["songs"]} == {s["filename"] for s in combo["songs"]}
+
+
+def test_smart_mode_lacks_lead_excludes_alt_lead(client, seeded_smart):
+    # arrangements_lacks=Lead must exclude rows whose smart_name is any Lead
+    # variant (Lead / Alt. Lead / Bonus Lead) AND ambiguous rows whose
+    # smart_name is explicitly null (we don't know if they have Lead).
+    data = _get(client, arrangements_lacks="Lead", naming_mode="smart")
+    files = {s["filename"] for s in data["songs"]}
+    assert "alt.psarc" not in files
+    assert "combo-old.psarc" not in files
+    assert "combo-ambig.psarc" not in files  # ambiguous — don't claim it lacks Lead
+    assert "bonus.psarc" in files  # has Bonus Rhythm, no Lead variant
+
+
 # ── Lyrics axis ─────────────────────────────────────────────────────────────
 
 def test_has_lyrics_require(client, seeded):

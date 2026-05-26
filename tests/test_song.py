@@ -18,6 +18,7 @@ from song import (
     arrangement_to_wire,
     chord_from_wire,
     chord_to_wire,
+    compute_smart_names,
     note_from_wire,
     note_to_wire,
     phrase_from_wire,
@@ -764,3 +765,165 @@ def test_string_count_ignores_rs_padded_tuning_for_bass():
         notes=[Note(time=float(i), string=i, fret=0) for i in range(4)],
     )
     assert arrangement_string_count(arr) == 4
+
+
+# ── compute_smart_names ───────────────────────────────────────────────────────
+
+def _sarr(path_lead=False, path_rhythm=False, path_bass=False,
+          bonus_arr=False, represent=0, name="Combo") -> Arrangement:
+    return Arrangement(
+        name=name,
+        path_lead=path_lead,
+        path_rhythm=path_rhythm,
+        path_bass=path_bass,
+        bonus_arr=bonus_arr,
+        represent=represent,
+    )
+
+
+def test_smart_names_single_lead():
+    assert compute_smart_names([_sarr(path_lead=True)]) == ["Lead"]
+
+
+def test_smart_names_single_rhythm():
+    assert compute_smart_names([_sarr(path_rhythm=True)]) == ["Rhythm"]
+
+
+def test_smart_names_single_bass():
+    assert compute_smart_names([_sarr(path_bass=True, name="Bass")]) == ["Bass"]
+
+
+def test_smart_names_lead_and_alt_lead():
+    # represent=1 → standard ("Lead"); represent=0 → alternate ("Alt. Lead")
+    arrs = [
+        _sarr(path_lead=True, represent=0),   # index 0 → Alt. Lead
+        _sarr(path_lead=True, represent=1),   # index 1 → Lead (standard)
+    ]
+    assert compute_smart_names(arrs) == ["Alt. Lead", "Lead"]
+
+
+def test_smart_names_three_leads_main():
+    # represent=1 → Lead; represent=0 and represent=2 → Alt. Lead 1 / 2
+    # Alts are sorted by represent ascending: 0 comes before 2.
+    arrs = [
+        _sarr(path_lead=True, represent=0),   # index 0 → Alt. Lead 1
+        _sarr(path_lead=True, represent=1),   # index 1 → Lead (standard)
+        _sarr(path_lead=True, represent=2),   # index 2 → Alt. Lead 2
+    ]
+    assert compute_smart_names(arrs) == ["Alt. Lead 1", "Lead", "Alt. Lead 2"]
+
+
+def test_smart_names_single_bonus_lead():
+    assert compute_smart_names([_sarr(path_lead=True, bonus_arr=True)]) == ["Bonus Lead"]
+
+
+def test_smart_names_two_bonus_leads():
+    arrs = [
+        _sarr(path_lead=True, bonus_arr=True, represent=0),
+        _sarr(path_lead=True, bonus_arr=True, represent=1),
+    ]
+    assert compute_smart_names(arrs) == ["Bonus Lead 1", "Bonus Lead 2"]
+
+
+def test_smart_names_full_mix():
+    # 1 lead + 1 alt lead + 1 bonus lead + 1 rhythm + 1 bass
+    # index 0: represent=0 → Alt. Lead
+    # index 1: represent=1 → Lead (standard)
+    # index 2: bonus_arr → Bonus Lead
+    # index 3: represent=0, single rhythm → Rhythm (fallback: no represent=1)
+    # index 4: represent=0, single bass   → Bass   (fallback: no represent=1)
+    arrs = [
+        _sarr(path_lead=True, represent=0),
+        _sarr(path_lead=True, represent=1),
+        _sarr(path_lead=True, bonus_arr=True, represent=0),
+        _sarr(path_rhythm=True, represent=0),
+        _sarr(path_bass=True, represent=0, name="Bass"),
+    ]
+    assert compute_smart_names(arrs) == [
+        "Alt. Lead", "Lead", "Bonus Lead", "Rhythm", "Bass"
+    ]
+
+
+def test_smart_names_unknown_name_returns_none():
+    # Arrangement without path flags and a name outside the fallback set
+    # (Lead / Rhythm / Bass / Combo) → None. Distinct from Vocals/ShowLights,
+    # which have their own explicit-skip coverage below.
+    assert compute_smart_names([_sarr(name="JustSomethingElse")]) == [None]
+
+
+def test_smart_names_name_fallback_when_path_flags_zero():
+    # CDLC often leaves path flags at 0; fall back to arrangement name
+    arrs = [_sarr(name="Lead"), _sarr(name="Rhythm"), _sarr(name="Bass")]
+    assert compute_smart_names(arrs) == ["Lead", "Rhythm", "Bass"]
+
+
+def test_smart_names_combo_treated_as_lead():
+    # "Combo" is a guitar arrangement — treated as Lead type for smart naming
+    arrs = [_sarr(name="Combo")]
+    assert compute_smart_names(arrs) == ["Lead"]
+
+
+def test_smart_names_recognises_display_names_from_load_song():
+    # load_song() synthesises display names like "Bonus Lead" / "Bass 2"
+    # when manifest JSON is missing. compute_smart_names must classify them
+    # via the name fallback (and infer bonus_arr for "Bonus *") so they
+    # don't fall through to None and break smart-mode filtering.
+    arrs = [
+        _sarr(name="Lead"),         # standard main
+        _sarr(name="Bonus Lead"),   # bonus → "Bonus Lead"
+        _sarr(name="Bass 2"),       # bass-typed → "Bass" (alone in its group)
+    ]
+    assert compute_smart_names(arrs) == ["Lead", "Bonus Lead", "Bass"]
+
+
+def test_smart_names_multiple_combos_get_alt_names():
+    # 3 Combo tracks with represent=0 → Lead, Alt. Lead 1, Alt. Lead 2
+    arrs = [_sarr(name="Combo"), _sarr(name="Combo"), _sarr(name="Combo")]
+    assert compute_smart_names(arrs) == ["Lead", "Alt. Lead 1", "Alt. Lead 2"]
+
+
+def test_smart_names_combo_and_bass_mixed():
+    # Real-world CDLC: 3 Combo + 1 Bass, all path flags zero
+    arrs = [
+        _sarr(name="Combo"),
+        _sarr(name="Combo"),
+        _sarr(name="Combo"),
+        _sarr(name="Bass"),
+    ]
+    names = compute_smart_names(arrs)
+    assert names == ["Lead", "Alt. Lead 1", "Alt. Lead 2", "Bass"]
+
+
+def test_smart_names_path_flags_take_priority_over_name():
+    # If path_rhythm is set, an arrangement named "Lead" is still Rhythm
+    arrs = [_sarr(name="Lead", path_rhythm=True)]
+    assert compute_smart_names(arrs) == ["Rhythm"]
+
+
+def test_smart_names_represent_ordering():
+    # Neither arrangement has represent=1, so the fallback applies:
+    # sort alts by represent ascending and promote the first as standard.
+    # represent=2 (index 1) < represent=5 (index 0) → index 1 becomes "Lead".
+    arrs = [
+        _sarr(path_lead=True, represent=5),
+        _sarr(path_lead=True, represent=2),
+    ]
+    names = compute_smart_names(arrs)
+    assert names[0] == "Alt. Lead"
+    assert names[1] == "Lead"
+
+
+def test_smart_names_vocals_returns_none():
+    # "Vocals" and other non-instrument names return null
+    assert compute_smart_names([_sarr(name="Vocals")]) == [None]
+    assert compute_smart_names([_sarr(name="ShowLights")]) == [None]
+
+
+def test_smart_names_arrangement_properties_defaults():
+    # Verify new dataclass fields have correct defaults
+    arr = Arrangement(name="Lead")
+    assert arr.path_lead is False
+    assert arr.path_rhythm is False
+    assert arr.path_bass is False
+    assert arr.bonus_arr is False
+    assert arr.represent == 0

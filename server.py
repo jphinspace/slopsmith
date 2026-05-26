@@ -27,6 +27,7 @@ from safepath import safe_join
 from song import (
     anchor_to_wire,
     arrangement_string_count,
+    compute_smart_names,
     chord_template_to_wire,
     chord_to_wire,
     hand_shape_to_wire,
@@ -246,6 +247,74 @@ def _env_flag(name: str) -> bool:
 
 # ── SQLite metadata cache ─────────────────────────────────────────────────────
 
+def _ensure_smart_names(arrangements: list[dict]) -> list[dict]:
+    """Fill in missing ``smart_name`` fields and sort arrangements by smart order.
+
+    Applied to every library query result so the client always receives
+    arrangements in priority order:
+      Lead → Alt. Lead [1,2,…] → Bonus Lead [1,2,…]
+      → Rhythm → Alt. Rhythm → Bonus Rhythm
+      → Bass → Alt. Bass → Bonus Bass → other
+
+    Rows scanned before the smart-naming feature was introduced don't carry a
+    ``smart_name`` key.  The background scanner automatically rescans those rows
+    to populate the field from authoritative manifest JSON path flags.
+
+    In the meantime this function provides a best-effort on-the-fly computation.
+    However, when multiple arrangements share the same name (e.g. two "Combo"
+    tracks in a PSARC that bundles all path flags as zero), name-based inference
+    cannot distinguish Lead from Rhythm — so we emit ``smart_name: null`` and
+    let the UI fall back to the legacy name until the background rescan corrects
+    the row.  Arrangements that already have the field are never modified.
+    """
+    if not arrangements:
+        return arrangements
+
+    # Fill in missing smart_name values.
+    if not all("smart_name" in a for a in arrangements):
+        # Detect duplicate raw names across ALL arrangements (not just the
+        # missing subset).  A duplicate anywhere means the name-based fallback
+        # may assign the same smart type a scanned row already owns — emit
+        # None for the missing entries and let the legacy name show through
+        # until the background rescan corrects them.
+        # Coerce to str so a malformed cached row with a list/dict name
+        # doesn't blow up the set() conversion (and every query that hits it).
+        all_names = [
+            a.get("name", "") if isinstance(a.get("name"), str) else str(a.get("name", ""))
+            for a in arrangements
+        ]
+        has_duplicates = len(all_names) != len(set(all_names))
+        if has_duplicates:
+            for a in arrangements:
+                if "smart_name" not in a:
+                    a["smart_name"] = None
+        else:
+            # No duplicates — name-based fallback is safe.
+            from song import Arrangement as _ArrCls
+            arr_objs = [
+                _ArrCls(
+                    name=a.get("name", ""),
+                    path_lead=a.get("_path_lead", False),
+                    path_rhythm=a.get("_path_rhythm", False),
+                    path_bass=a.get("_path_bass", False),
+                    bonus_arr=a.get("_bonus_arr", False),
+                    represent=a.get("_represent", 0),
+                )
+                for a in arrangements
+            ]
+            smart = compute_smart_names(arr_objs)
+            for a, sn in zip(arrangements, smart):
+                if "smart_name" not in a:
+                    a["smart_name"] = sn
+
+    # Always sort by smart priority order so the client receives a consistent
+    # list regardless of how the DB row was originally stored.
+    # _arr_smart_sort_key is defined later in this module but resolved at
+    # call-time, so the forward reference is safe.
+    arrangements.sort(key=_arr_smart_sort_key)
+    return arrangements
+
+
 class MetadataDB:
     def __init__(self):
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -395,12 +464,30 @@ class MetadataDB:
     # parameters are bound, but capping the input space is still cheap
     # defense-in-depth (see slopsmith#129).
     _ALLOWED_ARRANGEMENT_NAMES = {"Lead", "Rhythm", "Bass", "Combo"}
+    # Per-smart-type list of (sql_op, sql_param) pairs appended to the SQL
+    # name-fallback branch (key-absent smart_name). Covers legacy raw names
+    # and load_song()'s synthesised display names that map to each smart type.
+    _SMART_NULL_FALLBACK_EXTRAS: dict[str, tuple[tuple[str, str], ...]] = {
+        "Lead": (("=", "Combo"), ("LIKE", "Alt. Combo%"), ("LIKE", "Bonus Combo%")),
+        "Bass": (("=", "Bass 2"),),
+    }
     # Stem ids match the bare strings sloppak manifests use today —
     # `full`, `guitar`, `bass`, `drums`, `vocals`, `piano`, `other`. The
     # frontend filter UI omits `full` (it's the always-on fallback mix
     # and would match every sloppak), but the server-side whitelist
     # keeps it so a hand-rolled API client can still ask for it.
     _ALLOWED_STEM_IDS = {"full", "guitar", "bass", "drums", "vocals", "piano", "other"}
+
+    @classmethod
+    def _smart_null_extras(cls, arr_type: str) -> tuple[str, list[str]]:
+        """Return (sql_fragment, bound_params) for the extra raw-name terms to
+        OR into the key-absent NULL-smart_name fallback branch for arr_type.
+        Empty when no extras are defined."""
+        terms = cls._SMART_NULL_FALLBACK_EXTRAS.get(arr_type, ())
+        fragment = "".join(
+            f" OR json_extract(value, '$.name') {op} ?" for op, _ in terms
+        )
+        return fragment, [val for _, val in terms]
 
     def _build_where(self, q: str = "", favorites_only: bool = False,
                      format_filter: str = "",
@@ -409,7 +496,8 @@ class MetadataDB:
                      stems_has: list[str] | None = None,
                      stems_lacks: list[str] | None = None,
                      has_lyrics: int | None = None,
-                     tunings: list[str] | None = None) -> tuple[str, list]:
+                     tunings: list[str] | None = None,
+                     naming_mode: str = "legacy") -> tuple[str, list]:
         """Shared WHERE-clause builder for query_page / query_artists /
         query_stats. Returns (where_sql, params). Leading 'WHERE' is
         included so callers paste it directly. See slopsmith#129/#69.
@@ -424,22 +512,113 @@ class MetadataDB:
         if q:
             where += " AND (title LIKE ? COLLATE NOCASE OR artist LIKE ? COLLATE NOCASE OR album LIKE ? COLLATE NOCASE)"
             params += [f"%{q}%"] * 3
-        # arrangements_has: OR within axis (any-of). Uses JSON1's
-        # json_each which yields one row per arrangement, then matches
-        # the `name` field. The whole subquery is wrapped in EXISTS so
-        # we don't multiply rows in the outer SELECT.
+        # arrangements_has / arrangements_lacks: OR within axis (any-of).
+        # Uses JSON1's json_each which yields one row per arrangement, then
+        # matches the relevant field. The whole subquery is wrapped in EXISTS
+        # so we don't multiply rows in the outer SELECT.
+        #
+        # Smart mode: each requested type (Lead/Rhythm/Bass) matches against
+        # smart_name when present. "Lead" matches smart_name in
+        # ('Lead', 'Alt. Lead', 'Alt. Lead N', 'Bonus Lead', 'Bonus Lead N').
+        # Falls back to matching `name` for older rows without smart_name.
+        # Legacy mode: matches `name` directly (original behaviour).
         arr_has = [a for a in (arrangements_has or []) if a in self._ALLOWED_ARRANGEMENT_NAMES]
+        if arr_has and naming_mode == "smart":
+            # Smart mode subsumes "Combo" into "Lead" — normalize here so a
+            # hand-rolled API client matches the client-side behaviour and
+            # the SQL doesn't need a "Combo" smart-type branch.
+            arr_has = list(dict.fromkeys("Lead" if a == "Combo" else a for a in arr_has))
         if arr_has:
-            placeholders = ",".join(["?"] * len(arr_has))
-            where += (" AND EXISTS (SELECT 1 FROM json_each(songs.arrangements) "
-                      f"WHERE json_extract(value, '$.name') IN ({placeholders}))")
-            params += arr_has
+            if naming_mode == "smart":
+                clauses = []
+                for arr_type in arr_has:
+                    # Extra raw-name fragments matched only in the key-absent
+                    # NULL-smart_name fallback branch — they cover the legacy
+                    # display names that map to this smart type:
+                    #   Lead: "Combo" (combined guitar) + Alt./Bonus Combo
+                    #   Bass: "Bass 2" (load_song synthesises for real_bass_22)
+                    extra_null, extra_null_params = self._smart_null_extras(arr_type)
+                    # json_type() returns NULL when the key is absent and the
+                    # string 'null' when the key exists with explicit JSON null
+                    # (set by the scanner for ambiguous duplicate-name rows).
+                    # Name-fallback only applies to key-absent rows so an
+                    # explicit null suppresses the fallback and lets the
+                    # background rescan resolve the ambiguity authoritatively.
+                    clauses.append(
+                        "(json_extract(value, '$.smart_name') IS NOT NULL AND ("
+                        f"json_extract(value, '$.smart_name') = ? OR "
+                        f"json_extract(value, '$.smart_name') LIKE ? OR "
+                        f"json_extract(value, '$.smart_name') LIKE ?"
+                        ")) OR ("
+                        "json_type(value, '$.smart_name') IS NULL AND ("
+                        "json_extract(value, '$.name') = ? OR "
+                        "json_extract(value, '$.name') LIKE ? OR "
+                        f"json_extract(value, '$.name') LIKE ?{extra_null}))"
+                    )
+                    params += [
+                        arr_type,
+                        f"Alt. {arr_type}%",
+                        f"Bonus {arr_type}%",
+                        arr_type,
+                        f"Alt. {arr_type}%",
+                        f"Bonus {arr_type}%",
+                    ] + extra_null_params
+                where += (
+                    " AND EXISTS (SELECT 1 FROM json_each(songs.arrangements) WHERE "
+                    + " OR ".join(f"({c})" for c in clauses)
+                    + ")"
+                )
+            else:
+                placeholders = ",".join(["?"] * len(arr_has))
+                where += (" AND EXISTS (SELECT 1 FROM json_each(songs.arrangements) "
+                          f"WHERE json_extract(value, '$.name') IN ({placeholders}))")
+                params += arr_has
         arr_lacks = [a for a in (arrangements_lacks or []) if a in self._ALLOWED_ARRANGEMENT_NAMES]
+        if arr_lacks and naming_mode == "smart":
+            arr_lacks = list(dict.fromkeys("Lead" if a == "Combo" else a for a in arr_lacks))
         if arr_lacks:
-            placeholders = ",".join(["?"] * len(arr_lacks))
-            where += (" AND NOT EXISTS (SELECT 1 FROM json_each(songs.arrangements) "
-                      f"WHERE json_extract(value, '$.name') IN ({placeholders}))")
-            params += arr_lacks
+            if naming_mode == "smart":
+                clauses = []
+                for arr_type in arr_lacks:
+                    extra_null, extra_null_params = self._smart_null_extras(arr_type)
+                    # See "has" branch above for the json_type rationale.
+                    # Extra branch (vs `has`): an explicit smart_name=null
+                    # arrangement is ambiguous; we don't know whether it's
+                    # `arr_type` or not. Be conservative and treat it as
+                    # potentially matching, so `arrangements_lacks` excludes
+                    # the parent row instead of falsely claiming it lacks
+                    # `arr_type`. The background rescan resolves the ambiguity.
+                    clauses.append(
+                        "(json_extract(value, '$.smart_name') IS NOT NULL AND ("
+                        f"json_extract(value, '$.smart_name') = ? OR "
+                        f"json_extract(value, '$.smart_name') LIKE ? OR "
+                        f"json_extract(value, '$.smart_name') LIKE ?"
+                        ")) OR ("
+                        "json_type(value, '$.smart_name') = 'null'"
+                        ") OR ("
+                        "json_type(value, '$.smart_name') IS NULL AND ("
+                        "json_extract(value, '$.name') = ? OR "
+                        "json_extract(value, '$.name') LIKE ? OR "
+                        f"json_extract(value, '$.name') LIKE ?{extra_null}))"
+                    )
+                    params += [
+                        arr_type,
+                        f"Alt. {arr_type}%",
+                        f"Bonus {arr_type}%",
+                        arr_type,
+                        f"Alt. {arr_type}%",
+                        f"Bonus {arr_type}%",
+                    ] + extra_null_params
+                where += (
+                    " AND NOT EXISTS (SELECT 1 FROM json_each(songs.arrangements) WHERE "
+                    + " OR ".join(f"({c})" for c in clauses)
+                    + ")"
+                )
+            else:
+                placeholders = ",".join(["?"] * len(arr_lacks))
+                where += (" AND NOT EXISTS (SELECT 1 FROM json_each(songs.arrangements) "
+                          f"WHERE json_extract(value, '$.name') IN ({placeholders}))")
+                params += arr_lacks
         stems_h = [s for s in (stems_has or []) if s in self._ALLOWED_STEM_IDS]
         if stems_h:
             placeholders = ",".join(["?"] * len(stems_h))
@@ -475,13 +654,14 @@ class MetadataDB:
                    stems_has: list[str] | None = None,
                    stems_lacks: list[str] | None = None,
                    has_lyrics: int | None = None,
-                   tunings: list[str] | None = None) -> tuple[list[dict], int]:
+                   tunings: list[str] | None = None,
+                   naming_mode: str = "legacy") -> tuple[list[dict], int]:
         """Server-side paginated search. Returns (songs, total_count)."""
         where, params = self._build_where(
             q=q, favorites_only=favorites_only, format_filter=format_filter,
             arrangements_has=arrangements_has, arrangements_lacks=arrangements_lacks,
             stems_has=stems_has, stems_lacks=stems_lacks,
-            has_lyrics=has_lyrics, tunings=tunings,
+            has_lyrics=has_lyrics, tunings=tunings, naming_mode=naming_mode,
         )
 
         sort_map = {
@@ -549,7 +729,7 @@ class MetadataDB:
             songs.append({
                 "filename": r[0], "title": r[1], "artist": r[2], "album": r[3],
                 "year": r[4], "duration": r[5], "tuning": r[6],
-                "arrangements": json.loads(r[7]) if r[7] else [],
+                "arrangements": _ensure_smart_names(json.loads(r[7]) if r[7] else []),
                 "has_lyrics": bool(r[8]), "mtime": r[9],
                 "format": r[10] or "psarc",
                 "stem_count": int(r[11] or 0),
@@ -568,13 +748,14 @@ class MetadataDB:
                       stems_has: list[str] | None = None,
                       stems_lacks: list[str] | None = None,
                       has_lyrics: int | None = None,
-                      tunings: list[str] | None = None) -> tuple[list[dict], int]:
+                      tunings: list[str] | None = None,
+                      naming_mode: str = "legacy") -> tuple[list[dict], int]:
         """Get artists grouped by letter with their albums and songs. Returns (artists, total_artists)."""
         where, params = self._build_where(
             q=q, favorites_only=favorites_only, format_filter=format_filter,
             arrangements_has=arrangements_has, arrangements_lacks=arrangements_lacks,
             stems_has=stems_has, stems_lacks=stems_lacks,
-            has_lyrics=has_lyrics, tunings=tunings,
+            has_lyrics=has_lyrics, tunings=tunings, naming_mode=naming_mode,
         )
         if letter == "#":
             where += " AND artist NOT GLOB '[A-Za-z]*'"
@@ -625,7 +806,7 @@ class MetadataDB:
             artists[akey]["albums"][bkey]["songs"].append({
                 "filename": r[0], "title": r[1], "artist": r[2], "album": r[3],
                 "year": r[4], "duration": r[5], "tuning": r[6],
-                "arrangements": json.loads(r[7]) if r[7] else [],
+                "arrangements": _ensure_smart_names(json.loads(r[7]) if r[7] else []),
                 "has_lyrics": bool(r[8]),
                 "format": r[9] or "psarc",
                 "stem_count": int(r[10] or 0),
@@ -652,7 +833,8 @@ class MetadataDB:
                     stems_has: list[str] | None = None,
                     stems_lacks: list[str] | None = None,
                     has_lyrics: int | None = None,
-                    tunings: list[str] | None = None) -> dict:
+                    tunings: list[str] | None = None,
+                    naming_mode: str = "legacy") -> dict:
         """Aggregate stats for the letter bar. Accepts the same filter
         params as query_page so the letter counts stay synchronized
         with the grid when filters are active."""
@@ -660,7 +842,7 @@ class MetadataDB:
             q=q, favorites_only=favorites_only, format_filter=format_filter,
             arrangements_has=arrangements_has, arrangements_lacks=arrangements_lacks,
             stems_has=stems_has, stems_lacks=stems_lacks,
-            has_lyrics=has_lyrics, tunings=tunings,
+            has_lyrics=has_lyrics, tunings=tunings, naming_mode=naming_mode,
         )
         total = self.conn.execute(f"SELECT COUNT(*) FROM songs {where}", params).fetchone()[0]
         # NOCASE collation here mirrors `query_artists` and the per-
@@ -906,6 +1088,32 @@ def _require_library_provider_capability(provider: object, capability: str) -> N
     )
 
 
+_OPTIONAL_NEW_PROVIDER_KWARGS = ("naming_mode",)
+
+
+def _filter_provider_kwargs(method: object, kwargs: dict) -> dict:
+    """Drop kwargs that the method's signature does not declare.
+
+    Provides backward-compat for third-party library providers whose
+    query_page/query_artists/query_stats methods were written before
+    naming_mode was added — calling them with the extra kwarg would
+    raise TypeError and return a 500 to the client.
+
+    When ``inspect.signature`` cannot introspect the method (rare: C
+    extensions / built-ins / exotic callables), fall back to stripping
+    only the kwargs we know were added later — older providers won't
+    accept them, anything else stays so the call still works.
+    """
+    try:
+        sig = inspect.signature(method)  # type: ignore[arg-type]
+        for p in sig.parameters.values():
+            if p.kind == inspect.Parameter.VAR_KEYWORD:
+                return kwargs  # method accepts **kwargs, pass everything
+        return {k: v for k, v in kwargs.items() if k in sig.parameters}
+    except (ValueError, TypeError):
+        return {k: v for k, v in kwargs.items() if k not in _OPTIONAL_NEW_PROVIDER_KWARGS}
+
+
 def _call_library_provider(provider: object, method_name: str, **kwargs) -> Any:
     method = library_providers.provider_method(provider, method_name)
     if not callable(method):
@@ -915,7 +1123,7 @@ def _call_library_provider(provider: object, method_name: str, **kwargs) -> Any:
             detail=f"Library provider {provider_id!r} does not support {method_name}",
         )
     try:
-        return method(**kwargs)
+        return method(**_filter_provider_kwargs(method, kwargs))
     except HTTPException:
         raise
     except Exception as exc:
@@ -958,7 +1166,7 @@ async def _call_library_provider_async(provider: object, method_name: str, **kwa
     if _is_async_callable(method):
         # Async provider method — call directly on the event loop.
         try:
-            return await method(**kwargs)
+            return await method(**_filter_provider_kwargs(method, kwargs))
         except HTTPException:
             raise
         except Exception as exc:
@@ -1118,7 +1326,20 @@ def _extract_meta_fast(psarc_path: Path) -> dict:
                             if is_guitar:
                                 _tuning_from_guitar = True
                     notes = attrs.get("NotesHard", 0) or attrs.get("NotesMedium", 0) or 0
-                    arrangements.append({"index": arr_index, "name": arr_name, "notes": notes})
+                    # Read path flags for smart naming — stored temporarily with
+                    # underscore prefix and removed after smart names are computed.
+                    props = attrs.get("ArrangementProperties") or {}
+                    def _pi(key: str) -> int:
+                        try: return int(props.get(key, 0) or 0)
+                        except (TypeError, ValueError): return 0
+                    arrangements.append({
+                        "index": arr_index, "name": arr_name, "notes": notes,
+                        "_path_lead": bool(_pi("pathLead")),
+                        "_path_rhythm": bool(_pi("pathRhythm")),
+                        "_path_bass": bool(_pi("pathBass")),
+                        "_bonus_arr": bool(_pi("bonusArr")),
+                        "_represent": _pi("represent"),
+                    })
                     arr_index += 1
         except Exception:
             continue
@@ -1142,6 +1363,24 @@ def _extract_meta_fast(psarc_path: Path) -> dict:
     arrangements.sort(key=lambda a: priority.get(a["name"], 99))
     for i, a in enumerate(arrangements):
         a["index"] = i
+
+    # Compute smart names using the path flags read from the manifest.
+    # Build minimal Arrangement objects, then discard the temp flag fields.
+    from song import Arrangement as _ArrCls
+    _arr_objs = [
+        _ArrCls(
+            name=a["name"],
+            path_lead=a.pop("_path_lead", False),
+            path_rhythm=a.pop("_path_rhythm", False),
+            path_bass=a.pop("_path_bass", False),
+            bonus_arr=a.pop("_bonus_arr", False),
+            represent=a.pop("_represent", 0),
+        )
+        for a in arrangements
+    ]
+    _smart = compute_smart_names(_arr_objs)
+    for a, sn in zip(arrangements, _smart):
+        a["smart_name"] = sn
 
     return {
         "title": title, "artist": artist, "album": album, "year": year,
@@ -1170,6 +1409,15 @@ def _extract_meta_sloppak(path: Path) -> dict:
     # `extract_meta` already populates `stem_ids` (slopsmith#129);
     # default to empty for older callers / mocks.
     meta.setdefault("stem_ids", [])
+    # Compute smart names for sloppak arrangements using name-based fallback
+    # (sloppak manifests use display names like "Lead"/"Rhythm"/"Bass" directly).
+    arrs = meta.get("arrangements") or []
+    if arrs:
+        from song import Arrangement as _ArrCls
+        _arr_objs = [_ArrCls(name=a.get("name", "")) for a in arrs]
+        _smart = compute_smart_names(_arr_objs)
+        for a, sn in zip(arrs, _smart):
+            a["smart_name"] = sn
     return meta
 
 
@@ -1189,6 +1437,82 @@ def _resolve_dlc_path(dlc: Path, filename: str) -> Path | None:
     or escapes the DLC root.
     """
     return safe_join(dlc, filename)
+
+
+_SMART_TYPE_BASE: dict[str, int] = {"Lead": 0, "Rhythm": 10, "Bass": 20}
+
+
+def _arr_smart_sort_key(entry: dict) -> tuple[int, int]:
+    """Sort key for arrangement entries ordered by smart naming priority.
+
+    Order: Lead → Alt. Lead [1,2,…] → Bonus Lead [1,2,…]
+           → Rhythm → Alt. Rhythm → Bonus Rhythm
+           → Bass → Alt. Bass → Bonus Bass → other (stable fallback)
+    """
+    sn = entry.get("smart_name")
+    if not sn:
+        return (99, 0)
+    for label, base in _SMART_TYPE_BASE.items():
+        if sn == label:
+            return (base, 0)
+        alt_prefix = f"Alt. {label}"
+        if sn == alt_prefix:
+            return (base + 1, 0)
+        if sn.startswith(alt_prefix + " "):
+            suffix = sn[len(alt_prefix) + 1:]
+            return (base + 1, int(suffix) if suffix.isdigit() else 0)
+        bonus_prefix = f"Bonus {label}"
+        if sn == bonus_prefix:
+            return (base + 2, 0)
+        if sn.startswith(bonus_prefix + " "):
+            suffix = sn[len(bonus_prefix) + 1:]
+            return (base + 2, int(suffix) if suffix.isdigit() else 0)
+    return (99, 0)
+
+
+def _pick_smart_arrangement(
+    arrangements: list,
+    smart_names: list,
+    pref: str,
+) -> int:
+    """Return the best arrangement index for `pref` using smart-name priority.
+
+    Priority order:
+    1. Exact match  — smart_name == pref  (e.g. "Lead")
+    2. Alt. variants — "Alt. Lead", "Alt. Lead 1", ...
+    3. Bonus variants — "Bonus Lead", "Bonus Lead 1", ...
+    4. First arrangement in smart sort order (Lead > Rhythm > Bass > ...)
+
+    Returns -1 when `pref` is empty / "Auto" or `arrangements` is empty
+    (caller falls through to the existing most-notes fallback).
+    """
+    pref = (pref or "").strip()
+    if not pref or pref.lower() == "auto" or not arrangements:
+        return -1
+
+    sorted_pairs = sorted(
+        enumerate(smart_names),
+        key=lambda x: _arr_smart_sort_key({"smart_name": x[1]}),
+    )
+
+    alt_prefix = f"Alt. {pref}"
+    bonus_prefix = f"Bonus {pref}"
+
+    for i, sn in sorted_pairs:
+        if sn == pref:
+            return i
+
+    for i, sn in sorted_pairs:
+        if sn and (sn == alt_prefix or sn.startswith(alt_prefix + " ")):
+            return i
+
+    for i, sn in sorted_pairs:
+        if sn and (sn == bonus_prefix or sn.startswith(bonus_prefix + " ")):
+            return i
+
+    if sorted_pairs:
+        return sorted_pairs[0][0]
+    return 0
 
 
 def _sanitized_song_offset(song) -> float:
@@ -1307,9 +1631,13 @@ def _extract_meta_for_file(psarc_path: Path) -> dict:
         if song.arrangements and song.arrangements[0].tuning:
             tuning_offsets = list(song.arrangements[0].tuning)
             tuning = tuning_name(tuning_offsets)
+        _fb_smart = compute_smart_names(song.arrangements)
         arrangements = [
-            {"index": i, "name": a.name,
-             "notes": len(a.notes) + sum(len(c.notes) for c in a.chords)}
+            {
+                "index": i, "name": a.name,
+                "notes": len(a.notes) + sum(len(c.notes) for c in a.chords),
+                "smart_name": _fb_smart[i],
+            }
             for i, a in enumerate(song.arrangements)
         ]
         has_lyrics = False
@@ -1515,6 +1843,18 @@ def _background_scan():
             log.warning("scan cache lookup failed for %s: %s", cache_key, e)
             cached = None
         if not cached:
+            to_scan.append((f, mtime, size))
+        elif cached.get("arrangements") and any(
+            "smart_name" not in a for a in cached["arrangements"]
+        ):
+            # Row was scanned before smart naming was introduced — force a
+            # rescan so the DB picks up authoritative path flags from the
+            # manifest JSON and stores correct smart_name values. Don't
+            # re-queue rows where smart_name is explicitly null: the writer
+            # only emits that when compute_smart_names truly can't classify
+            # the arrangement (e.g. a name outside the recognised set with
+            # zero path flags), so rescanning would produce the same null
+            # forever and never converge.
             to_scan.append((f, mtime, size))
 
     if not to_scan:
@@ -2625,7 +2965,8 @@ async def list_library(q: str = "", page: int = 0, size: int = 24, sort: str = "
                        dir: str = "asc", favorites: int = 0, format: str = "",
                        arrangements_has: str = "", arrangements_lacks: str = "",
                        stems_has: str = "", stems_lacks: str = "",
-                       has_lyrics: str = "", tunings: str = "", provider: str = "local"):
+                       has_lyrics: str = "", tunings: str = "", provider: str = "local",
+                       naming_mode: str = "legacy"):
     """Paginated library search through the selected library provider."""
     size = min(size, 100)
     library_provider = _get_library_provider(provider)
@@ -2637,6 +2978,7 @@ async def list_library(q: str = "", page: int = 0, size: int = 24, sort: str = "
         size=size,
         sort=sort,
         direction=dir,
+        naming_mode=naming_mode,
         **_library_filter_args(
             q=q, favorites=favorites, format=format,
             arrangements_has=arrangements_has, arrangements_lacks=arrangements_lacks,
@@ -2652,7 +2994,8 @@ async def list_artists(letter: str = "", q: str = "", favorites: int = 0, page: 
                        size: int = 50, format: str = "",
                        arrangements_has: str = "", arrangements_lacks: str = "",
                        stems_has: str = "", stems_lacks: str = "",
-                       has_lyrics: str = "", tunings: str = "", provider: str = "local"):
+                       has_lyrics: str = "", tunings: str = "", provider: str = "local",
+                       naming_mode: str = "legacy"):
     """Get artists grouped by letter with albums and songs (for tree view)."""
     size = min(size, 100)
     library_provider = _get_library_provider(provider)
@@ -2663,6 +3006,7 @@ async def list_artists(letter: str = "", q: str = "", favorites: int = 0, page: 
         letter=letter,
         page=page,
         size=size,
+        naming_mode=naming_mode,
         **_library_filter_args(
             q=q, favorites=favorites, format=format,
             arrangements_has=arrangements_has, arrangements_lacks=arrangements_lacks,
@@ -2677,7 +3021,8 @@ async def list_artists(letter: str = "", q: str = "", favorites: int = 0, page: 
 async def library_stats(favorites: int = 0, q: str = "", format: str = "",
                         arrangements_has: str = "", arrangements_lacks: str = "",
                         stems_has: str = "", stems_lacks: str = "",
-                        has_lyrics: str = "", tunings: str = "", provider: str = "local"):
+                        has_lyrics: str = "", tunings: str = "", provider: str = "local",
+                        naming_mode: str = "legacy"):
     """Aggregate stats for the UI. Accepts the same filter params as
     /api/library so the letter bar mirrors the active grid filter set."""
     library_provider = _get_library_provider(provider)
@@ -2685,6 +3030,7 @@ async def library_stats(favorites: int = 0, q: str = "", format: str = "",
     return await _call_library_provider_async(
         library_provider,
         "query_stats",
+        naming_mode=naming_mode,
         **_library_filter_args(
             q=q, favorites=favorites, format=format,
             arrangements_has=arrangements_has, arrangements_lacks=arrangements_lacks,
@@ -4146,7 +4492,7 @@ def serve_sloppak_file(filename: str, rel_path: str):
 
 
 @app.websocket("/ws/highway/{filename:path}")
-async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1):
+async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1, naming_mode: str = "legacy"):
     """Stream song data for the highway renderer over WebSocket."""
     await websocket.accept()
     structlog.contextvars.bind_contextvars(ws_conn_id=uuid.uuid4().hex[:8])
@@ -4226,6 +4572,9 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
             await websocket.close()
             return
 
+        # Smart names are needed for smart-mode arrangement selection.
+        smart_names = compute_smart_names(song.arrangements)
+
         # Pick arrangement: explicit request > user preference > most notes
         best = -1
         if 0 <= arrangement < len(song.arrangements):
@@ -4240,10 +4589,13 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
                 except Exception:
                     pass
             if pref:
-                for i, a in enumerate(song.arrangements):
-                    if a.name == pref:
-                        best = i
-                        break
+                if naming_mode == "smart":
+                    best = _pick_smart_arrangement(song.arrangements, smart_names, pref)
+                else:
+                    for i, a in enumerate(song.arrangements):
+                        if a.name == pref:
+                            best = i
+                            break
         if best < 0:
             # Fallback: most notes
             best = 0
@@ -4386,15 +4738,28 @@ async def highway_ws(websocket: WebSocket, filename: str, arrangement: int = -1)
             _evict_audio_cache()
 
         # Send song metadata
-        arr_list = [{"index": i, "name": a.name, "notes": len(a.notes) + sum(len(c.notes) for c in a.chords)}
-                    for i, a in enumerate(song.arrangements)]
+        arr_list = [
+            {
+                "index": i,
+                "name": a.name,
+                "smart_name": smart_names[i],
+                "notes": len(a.notes) + sum(len(c.notes) for c in a.chords),
+            }
+            for i, a in enumerate(song.arrangements)
+        ]
+        arr_list.sort(key=_arr_smart_sort_key)
         await websocket.send_json({
             "type": "song_info",
             "title": song.title,
             "artist": song.artist,
             "duration": song.song_length,
             "arrangement": arr.name,
+            "arrangement_smart_name": smart_names[best],
             "arrangement_index": best,
+            # Echo the resolved naming mode so highway.js doesn't have to
+            # re-read localStorage (which can be unavailable / disagree with
+            # app.js's in-memory cache when storage writes fail).
+            "naming_mode": "smart" if naming_mode == "smart" else "legacy",
             "arrangements": arr_list,
             "audio_url": audio_url,
             "audio_error": audio_error,

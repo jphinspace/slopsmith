@@ -1297,7 +1297,58 @@ let _libEpoch = 0;
 // + Rhythm = "has Lead OR Rhythm"); cross-axis is AND. Tri-state pills
 // translate to `_has` / `_lacks` lists on the wire so the server's
 // SQL doesn't have to encode the third "any" state.
-const _ARRANGEMENTS = ['Lead', 'Rhythm', 'Bass', 'Combo'];
+// In smart mode Combo is subsumed into Lead; only show Lead/Rhythm/Bass.
+// In legacy mode keep the original four values.
+// In-memory cache so a localStorage.setItem failure (private mode / quota /
+// disabled storage) still keeps the chosen mode for the rest of the session.
+// Initialised lazily from localStorage on first read.
+let _arrangementNamingMode = null;
+function _getArrangementNamingMode() {
+    if (_arrangementNamingMode === 'smart' || _arrangementNamingMode === 'legacy') {
+        return _arrangementNamingMode;
+    }
+    try {
+        _arrangementNamingMode = localStorage.getItem('arrangementNamingMode') === 'legacy' ? 'legacy' : 'smart';
+    } catch (_) {
+        _arrangementNamingMode = 'smart';
+    }
+    return _arrangementNamingMode;
+}
+// In smart mode 'Combo' is subsumed into 'Lead' (_ensure_smart_names maps it
+// the same way). Normalize any persisted 'Combo' tokens before querying or
+// rendering so the UI and the server stay in sync.
+function _toSmartArrs(arr) {
+    return arr.map(a => a === 'Combo' ? 'Lead' : a);
+}
+function _onNamingModeChange(value) {
+    const mode = value === 'legacy' ? 'legacy' : 'smart';
+    _arrangementNamingMode = mode;
+    try { localStorage.setItem('arrangementNamingMode', mode); } catch (_) {}
+    if (mode === 'smart') {
+        _libFilters.arrHas   = _toSmartArrs(_libFilters.arrHas);
+        _libFilters.arrLacks = _toSmartArrs(_libFilters.arrLacks);
+        _saveLibFilters();
+    }
+    _renderLibFilterDrawer();
+    _renderLibFilterChips();
+    _libEpoch++;
+    currentPage = 0;
+    _treeStats = null;
+    loadLibrary(0);
+}
+function _getArrangements() {
+    return _getArrangementNamingMode() === 'smart'
+        ? ['Lead', 'Rhythm', 'Bass']
+        : ['Lead', 'Rhythm', 'Bass', 'Combo'];
+}
+function _arrangementBadgeHtml(arrangement, nm) {
+    const label = (nm === 'smart' && arrangement.smart_name) ? arrangement.smart_name : arrangement.name;
+    const cls = label.includes('Lead')   ? 'bg-red-900/40 text-red-300' :
+                label.includes('Rhythm') ? 'bg-blue-900/40 text-blue-300' :
+                label.includes('Bass')   ? 'bg-green-900/40 text-green-300' :
+                'bg-dark-600 text-gray-400';
+    return `<span class="px-1.5 py-0.5 rounded ${cls}">${esc(label)}</span>`;
+}
 // Stem ids match the bare strings sloppak manifests use ("drums",
 // "bass", etc.). `full` is intentionally omitted from the filter UI:
 // it's the fallback mix every sloppak ships with, so filtering by it
@@ -1351,7 +1402,13 @@ function _loadLibFilters() {
     try {
         const raw = localStorage.getItem(_LIB_FILTERS_KEY);
         if (!raw) return _defaultLibFilters();
-        return _normalizeLibFilters(JSON.parse(raw));
+        const filters = _normalizeLibFilters(JSON.parse(raw));
+        // Normalize any stale 'Combo' tokens left from legacy-mode sessions.
+        if (_getArrangementNamingMode() === 'smart') {
+            filters.arrHas   = _toSmartArrs(filters.arrHas);
+            filters.arrLacks = _toSmartArrs(filters.arrLacks);
+        }
+        return filters;
     } catch {
         return _defaultLibFilters();
     }
@@ -1374,8 +1431,12 @@ function _libActiveCount() {
 }
 
 function _applyLibFiltersToParams(params) {
-    if (_libFilters.arrHas.length) params.set('arrangements_has', _libFilters.arrHas.join(','));
-    if (_libFilters.arrLacks.length) params.set('arrangements_lacks', _libFilters.arrLacks.join(','));
+    const nm = _getArrangementNamingMode();
+    params.set('naming_mode', nm);
+    const arrHas   = nm === 'smart' ? _toSmartArrs(_libFilters.arrHas)   : _libFilters.arrHas;
+    const arrLacks = nm === 'smart' ? _toSmartArrs(_libFilters.arrLacks) : _libFilters.arrLacks;
+    if (arrHas.length)   params.set('arrangements_has',   arrHas.join(','));
+    if (arrLacks.length) params.set('arrangements_lacks', arrLacks.join(','));
     if (_libFilters.stemsHas.length) params.set('stems_has', _libFilters.stemsHas.join(','));
     if (_libFilters.stemsLacks.length) params.set('stems_lacks', _libFilters.stemsLacks.join(','));
     if (_libFilters.lyrics !== null) params.set('has_lyrics', String(_libFilters.lyrics));
@@ -1534,7 +1595,7 @@ function _updateLibFiltersBadge() {
 }
 
 function _renderLibFilterDrawer() {
-    _renderPillRow('filter-arrangements', _ARRANGEMENTS, 'arrHas', 'arrLacks');
+    _renderPillRow('filter-arrangements', _getArrangements(), 'arrHas', 'arrLacks');
     _renderPillRow('filter-stems', _STEM_DEFS, 'stemsHas', 'stemsLacks', s => s.label);
     _renderLyricsPill();
     // Stems section dimmed when format=psarc (no stems exist).
@@ -1881,14 +1942,7 @@ function renderGridCards(songs, containerId = 'lib-grid', mode = 'replace') {
                     </div>
                 </div>
                 <div class="flex items-center flex-wrap gap-1.5 mt-3 text-xs">
-                    ${(song.arrangements || []).map(arrangement =>
-                        `<span class="px-1.5 py-0.5 rounded ${
-                            arrangement.name === 'Lead' ? 'bg-red-900/40 text-red-300' :
-                            arrangement.name === 'Rhythm' ? 'bg-blue-900/40 text-blue-300' :
-                            arrangement.name === 'Bass' ? 'bg-green-900/40 text-green-300' :
-                            'bg-dark-600 text-gray-400'
-                        }">${esc(arrangement.name)}</span>`
-                    ).join('')}
+                    ${(() => { const _nm = _getArrangementNamingMode(); return (song.arrangements || []).map(a => _arrangementBadgeHtml(a, _nm)).join(''); })()}
                     ${tuning ? `<span class="px-1.5 py-0.5 rounded ${tuning === 'E Standard' ? 'bg-green-900/30 text-green-400' : 'bg-yellow-900/30 text-yellow-400'}">${esc(tuning)}</span>` : ''}
                     ${song.has_lyrics ? `<span class="px-1.5 py-0.5 bg-purple-900/30 rounded text-purple-300">Lyrics</span>` : ''}
                     ${duration ? `<span class="text-gray-600">${duration}</span>` : ''}
@@ -2082,13 +2136,9 @@ async function renderTreeInto(containerId, countId, stats, letter, q, favoritesO
                 html += `<div class="song-row" ${rowAttrs} data-artist="${_escAttr(artist.name || '')}" ${rowInteractiveAttrs}>`;
                 html += `<div class="flex-1 min-w-0 flex items-center gap-2"><span class="text-sm text-white truncate block">${esc(title)}</span>${formatBadgeInline(song.format, song.stem_count)}</div>`;
                 html += `<div class="flex items-center gap-1.5 flex-shrink-0 text-xs">`;
-                for (const arrangement of (song.arrangements || [])) {
-                    const cls = arrangement.name === 'Lead' ? 'bg-red-900/40 text-red-300' :
-                                arrangement.name === 'Rhythm' ? 'bg-blue-900/40 text-blue-300' :
-                                arrangement.name === 'Bass' ? 'bg-green-900/40 text-green-300' :
-                                'bg-dark-600 text-gray-400';
-                    html += `<span class="px-1.5 py-0.5 rounded ${cls}">${esc(arrangement.name)}</span>`;
-                }
+                { const _nm = _getArrangementNamingMode();
+                  for (const arrangement of (song.arrangements || []))
+                      html += _arrangementBadgeHtml(arrangement, _nm); }
                 if (tuning)
                     html += `<span class="px-1.5 py-0.5 rounded ${tuning === 'E Standard' ? 'bg-green-900/30 text-green-400' : 'bg-yellow-900/30 text-yellow-400'}">${esc(tuning)}</span>`;
                 if (song.has_lyrics)
@@ -2376,6 +2426,9 @@ async function loadSettings() {
     setAvOffsetMs(Number(data.av_offset_ms) || 0, /* skipPersist */ true);
     const psarcPlatformEl = document.getElementById('psarc-platform');
     if (psarcPlatformEl) psarcPlatformEl.value = data.psarc_platform || 'both';
+    // Arrangement naming mode is localStorage-only (client preference).
+    const namingModeEl = document.getElementById('arrangement-naming-mode');
+    if (namingModeEl) namingModeEl.value = _getArrangementNamingMode();
     // Native folder picker — only present when running inside slopsmith-desktop.
     if (window.slopsmithDesktop && typeof window.slopsmithDesktop.pickDirectory === 'function') {
         document.getElementById('btn-pick-dlc')?.classList.remove('hidden');
@@ -4457,8 +4510,10 @@ async function playSong(filename, arrangement) {
     await new Promise(r => setTimeout(r, 500));
     highway.init(document.getElementById('highway'));
 
-    const arrParam = arrangement !== undefined ? `?arrangement=${arrangement}` : '';
-    const wsUrl = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws/highway/${decodeURIComponent(filename)}${arrParam}`;
+    const wsParams = new URLSearchParams();
+    if (arrangement !== undefined) wsParams.set('arrangement', arrangement);
+    wsParams.set('naming_mode', _getArrangementNamingMode());
+    const wsUrl = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws/highway/${decodeURIComponent(filename)}?${wsParams.toString()}`;
     highway.connect(wsUrl);
     loadSavedLoops();
     document.getElementById('quality-select').value = highway.getRenderScale();

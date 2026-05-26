@@ -2,7 +2,8 @@
 
 Covers the per-phrase difficulty ladder logic added in slopsmith#48
 (Phrase / PhraseLevel extraction, None-sentinel semantics, the
-fallback paths for missing or unusable phrase metadata).
+fallback paths for missing or unusable phrase metadata) and the
+<arrangementProperties> flag parsing for smart naming.
 """
 
 import math
@@ -489,3 +490,76 @@ def test_parse_arrangement_6_string_template_no_width_inflation(tmp_path):
     ct = arr.chord_templates[0]
     assert len(ct.frets) == 6
     assert len(ct.fingers) == 6
+
+
+# ── <arrangementProperties> parsing for smart naming ─────────────────────────
+
+_EMPTY_LEVELS = (
+    '<levels count="1">'
+    '<level difficulty="0">'
+    '<notes count="0"/><chords count="0"/>'
+    '<anchors count="0"/><handShapes count="0"/>'
+    "</level></levels>"
+)
+
+
+def test_arrangement_properties_lead_parsed(tmp_path):
+    xml = (
+        "<song>"
+        + _TUNING_AND_TEMPLATES
+        + '<arrangementProperties pathLead="1" pathRhythm="0" pathBass="0"'
+        + ' bonusArr="0" represent="3"/>'
+        + _EMPTY_LEVELS
+        + "</song>"
+    )
+    arr = parse_arrangement(_write_xml(tmp_path, xml))
+    assert arr.path_lead is True
+    assert arr.path_rhythm is False
+    assert arr.path_bass is False
+    assert arr.bonus_arr is False
+    assert arr.represent == 3
+
+
+def test_arrangement_properties_bass_bonus_parsed(tmp_path):
+    xml = (
+        "<song>"
+        + _TUNING_AND_TEMPLATES
+        + '<arrangementProperties pathLead="0" pathRhythm="0" pathBass="1"'
+        + ' bonusArr="1" represent="7"/>'
+        + _EMPTY_LEVELS
+        + "</song>"
+    )
+    arr = parse_arrangement(_write_xml(tmp_path, xml))
+    assert arr.path_lead is False
+    assert arr.path_bass is True
+    assert arr.bonus_arr is True
+    assert arr.represent == 7
+
+
+def test_arrangement_properties_defaults_when_element_missing(tmp_path):
+    xml = (
+        "<song>"
+        + _TUNING_AND_TEMPLATES
+        + _EMPTY_LEVELS
+        + "</song>"
+    )
+    arr = parse_arrangement(_write_xml(tmp_path, xml))
+    assert arr.path_lead is False
+    assert arr.path_rhythm is False
+    assert arr.path_bass is False
+    assert arr.bonus_arr is False
+    assert arr.represent == 0
+
+
+def test_arrangement_properties_represent_zero_is_default(tmp_path):
+    xml = (
+        "<song>"
+        + _TUNING_AND_TEMPLATES
+        + '<arrangementProperties pathLead="1" pathRhythm="0" pathBass="0"'
+        + ' bonusArr="0" represent="0"/>'
+        + _EMPTY_LEVELS
+        + "</song>"
+    )
+    arr = parse_arrangement(_write_xml(tmp_path, xml))
+    assert arr.represent == 0
+    assert arr.path_lead is True

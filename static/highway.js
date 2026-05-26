@@ -2474,7 +2474,19 @@ function createHighway() {
                             } else {
                                 document.getElementById('hud-artist').textContent = msg.artist;
                                 document.getElementById('hud-title').textContent = msg.title;
-                                document.getElementById('hud-arrangement').textContent = msg.arrangement;
+                                // Prefer the server-echoed naming_mode (resolved from
+                                // the WS query param) so the HUD stays consistent with
+                                // app.js's in-memory cache even when localStorage is
+                                // unavailable. Fall back to localStorage for older
+                                // backends that don't echo it yet.
+                                let namingMode = msg.naming_mode;
+                                if (namingMode !== 'smart' && namingMode !== 'legacy') {
+                                    try { namingMode = localStorage.getItem('arrangementNamingMode') === 'legacy' ? 'legacy' : 'smart'; } catch (_) { namingMode = 'smart'; }
+                                }
+                                const arrLabel = (namingMode === 'smart' && msg.arrangement_smart_name)
+                                    ? msg.arrangement_smart_name
+                                    : msg.arrangement;
+                                document.getElementById('hud-arrangement').textContent = arrLabel;
     
                                 // Clear any lingering audio-error banner from a prior song.
                                 const existingAudioErr = document.getElementById('audio-error-banner');
@@ -2650,9 +2662,23 @@ function createHighway() {
                                 // Populate arrangement dropdown
                                 if (msg.arrangements) {
                                     const sel = document.getElementById('arr-select');
-                                    sel.innerHTML = msg.arrangements.map(a =>
-                                        `<option value="${a.index}" ${a.index === msg.arrangement_index ? 'selected' : ''}>${a.name} (${a.notes})</option>`
-                                    ).join('');
+                                    // Server-echoed naming_mode preferred; see HUD branch above.
+                                    let namingMode = msg.naming_mode;
+                                    if (namingMode !== 'smart' && namingMode !== 'legacy') {
+                                        try { namingMode = localStorage.getItem('arrangementNamingMode') === 'legacy' ? 'legacy' : 'smart'; } catch (_) { namingMode = 'smart'; }
+                                    }
+                                    sel.textContent = '';
+                                    for (const a of msg.arrangements) {
+                                        const displayName = (namingMode === 'smart' && a.smart_name) ? a.smart_name : a.name;
+                                        // Keep the note-count suffix in both modes — useful for
+                                        // disambiguating sibling arrangements (e.g. two "Alt. Lead"s).
+                                        const label = `${displayName} (${a.notes})`;
+                                        const opt = document.createElement('option');
+                                        opt.value = a.index;
+                                        opt.selected = a.index === msg.arrangement_index;
+                                        opt.textContent = label;
+                                        sel.appendChild(opt);
+                                    }
                                 }
                             }
                             // Plugin context API — broadcast current song state
@@ -2665,6 +2691,7 @@ function createHighway() {
                                     artist: msg.artist,
                                     duration: msg.duration,
                                     arrangement: msg.arrangement,
+                                    arrangementSmartName: msg.arrangement_smart_name ?? null,
                                     arrangementIndex: msg.arrangement_index,
                                     arrangements: msg.arrangements || [],
                                     tuning: msg.tuning,

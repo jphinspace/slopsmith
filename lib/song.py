@@ -142,6 +142,13 @@ class Arrangement:
     # `base`/`changes` drive the highway tone-change markers; `definitions`
     # feed the Tones plugin gear panel.
     tones: dict | None = None
+    # RS XML <arrangementProperties> flags for smart naming (slopsmith feat/arrangement).
+    # Populated from the XML; default False/0 for sloppak / GP-imported sources.
+    path_lead: bool = False
+    path_rhythm: bool = False
+    path_bass: bool = False
+    bonus_arr: bool = False
+    represent: int = 0
 
 
 @dataclass
@@ -432,6 +439,133 @@ def arrangement_string_count(arr: Arrangement) -> int:
     tuning_len = len(arr.tuning)
     tuning_count = tuning_len if tuning_len != 6 else 0
     return max(notes_count, name_based, tuning_count)
+
+
+def compute_smart_names(arrangements: list[Arrangement]) -> list[str | None]:
+    """Compute smart display names for arrangements based on RS XML path flags.
+
+    Returns a list parallel to `arrangements`. Each entry is a descriptive
+    name like "Lead", "Alt. Lead", "Bonus Rhythm", "Bass", or None for
+    non-instrument arrangements (Vocals, ShowLights) and unrecognised
+    names whose path flags are all zero.
+
+    Path-type resolution (first match wins):
+    1. XML <arrangementProperties> flags (path_lead / path_rhythm / path_bass)
+    2. Name-based fallback when ALL three flags are zero — keeps sloppak /
+       GP-imported sources and CDLC with unset flags working by mapping
+       "Lead" / "Rhythm" / "Bass" / "Combo" → the matching path. Anything
+       outside that set (Vocals, ShowLights, …) → None.
+
+    Naming rules per path type (Lead / Rhythm / Bass):
+    - Main group (bonusArr=False):
+        represent=1 → "Lead" (or "Rhythm" / "Bass") — the canonical
+            arrangement. If no entry has represent=1 (CDLC with all-zero
+            flags), the first by represent-ascending order is promoted.
+        remaining (n_alts == 1) → "Alt. Lead"
+        remaining (n_alts >= 2) → "Alt. Lead 1", "Alt. Lead 2", ...
+          (sorted by represent ascending)
+    - Bonus group (bonusArr=True), sorted by represent ascending:
+        single → "Bonus Lead"
+        multiple → "Bonus Lead 1", "Bonus Lead 2", ...
+    """
+    result: list[str | None] = [None] * len(arrangements)
+
+    # Name-to-(path_attr, bonus_override) fallback used when all XML path
+    # flags are zero. "Combo" is a guitar arrangement (lead + rhythm combined)
+    # — treat as Lead. load_song() also synthesises display names like
+    # "Bonus Lead" / "Bass 2" when manifest data is missing, so we recognise
+    # those too and force the bonus flag for "Bonus *". `None` for the
+    # override means "leave the dataclass's bonus_arr alone".
+    _NAME_FALLBACK: dict[str, tuple[str, bool | None]] = {
+        "lead": ("path_lead", None),
+        "rhythm": ("path_rhythm", None),
+        "bass": ("path_bass", None),
+        "bass 2": ("path_bass", None),
+        "combo": ("path_lead", None),
+        "bonus lead": ("path_lead", True),
+        "bonus rhythm": ("path_rhythm", True),
+        "bonus bass": ("path_bass", True),
+        "alt. lead": ("path_lead", False),
+        "alt. rhythm": ("path_rhythm", False),
+        "alt. bass": ("path_bass", False),
+    }
+
+    def _resolve(a: Arrangement) -> tuple[str | None, bool]:
+        """Return (path_attr, bonus_arr) for an arrangement, applying the
+        name-based fallback when XML flags are all zero. Defensive against
+        non-string names from hand-edited PSARCs / sloppak JSON."""
+        if a.path_lead:
+            return "path_lead", bool(a.bonus_arr)
+        if a.path_rhythm:
+            return "path_rhythm", bool(a.bonus_arr)
+        if a.path_bass:
+            return "path_bass", bool(a.bonus_arr)
+        name = a.name if isinstance(a.name, str) else ""
+        entry = _NAME_FALLBACK.get(name.strip().lower())
+        if entry is None:
+            return None, bool(a.bonus_arr)
+        path_attr, bonus_override = entry
+        return path_attr, bool(a.bonus_arr) if bonus_override is None else bonus_override
+
+    _resolved = [_resolve(a) for a in arrangements]
+
+    for path_attr, label in (
+        ("path_lead", "Lead"),
+        ("path_rhythm", "Rhythm"),
+        ("path_bass", "Bass"),
+    ):
+        type_arrs = [
+            (i, arrangements[i]) for i, (pa, _bonus) in enumerate(_resolved)
+            if pa == path_attr
+        ]
+        if not type_arrs:
+            continue
+
+        # Main group (bonusArr=False):
+        #   represent=1 → standard arrangement ("Lead")
+        #   represent=0 (or any value != 1) → alternate arrangement ("Alt. Lead")
+        #
+        # If no arrangement has represent=1 (e.g. CDLC defaults or all-zero
+        # flags with name fallback), fall back to treating the first by
+        # represent-ascending order as the standard so there is always a "Lead".
+        main_pairs = [(i, a) for i, a in type_arrs if not _resolved[i][1]]
+        standard = [(i, a) for i, a in main_pairs if a.represent == 1]
+        alts = sorted(
+            [(i, a) for i, a in main_pairs if a.represent != 1],
+            key=lambda x: x[1].represent,
+        )
+        if not standard and alts:
+            standard = [alts[0]]
+            alts = alts[1:]
+        # Guard: if somehow multiple represent=1 exist, promote only the first.
+        if len(standard) > 1:
+            extra = sorted(standard[1:], key=lambda x: x[1].represent)
+            alts = sorted(extra + alts, key=lambda x: x[1].represent)
+            standard = standard[:1]
+
+        for i, _ in standard:
+            result[i] = label
+
+        n_alts = len(alts)
+        for j, (i, _) in enumerate(alts):
+            if n_alts == 1:
+                result[i] = f"Alt. {label}"
+            else:
+                result[i] = f"Alt. {label} {j + 1}"
+
+        # Bonus group (bonusArr=True): sorted by represent ascending.
+        bonus_arrs = sorted(
+            [(i, a) for i, a in type_arrs if _resolved[i][1]],
+            key=lambda x: x[1].represent,
+        )
+        n_bonus = len(bonus_arrs)
+        for j, (i, _) in enumerate(bonus_arrs):
+            if n_bonus == 1:
+                result[i] = f"Bonus {label}"
+            else:
+                result[i] = f"Bonus {label} {j + 1}"
+
+    return result
 
 
 def arrangement_to_wire(arr: Arrangement) -> dict:
@@ -937,6 +1071,17 @@ def parse_arrangement(xml_path: str) -> Arrangement:
     anchors.sort(key=lambda a: a.time)
     hand_shapes.sort(key=lambda h: h.start_time)
 
+    # Parse <arrangementProperties> for smart naming
+    path_lead = path_rhythm = path_bass = bonus_arr = False
+    represent = 0
+    el = root.find("arrangementProperties")
+    if el is not None:
+        path_lead = _bool(el, "pathLead")
+        path_rhythm = _bool(el, "pathRhythm")
+        path_bass = _bool(el, "pathBass")
+        bonus_arr = _bool(el, "bonusArr")
+        represent = _int(el, "represent", 0)
+
     return Arrangement(
         name=arr_name,
         tuning=tuning,
@@ -947,6 +1092,11 @@ def parse_arrangement(xml_path: str) -> Arrangement:
         hand_shapes=hand_shapes,
         chord_templates=chord_templates,
         phrases=phrases,
+        path_lead=path_lead,
+        path_rhythm=path_rhythm,
+        path_bass=path_bass,
+        bonus_arr=bonus_arr,
+        represent=represent,
     )
 
 
@@ -1045,8 +1195,20 @@ def load_song(extracted_dir: str) -> Song:
     song = Song()
     xml_files = sorted(Path(extracted_dir).rglob("*.xml"))
 
-    # Build manifest lookup: xml_stem (lowercase) -> ArrangementName
-    _manifest_names = {}
+    # Build manifest lookups: xml_stem (lowercase) -> ArrangementName / path flags.
+    # The manifest JSON is the authoritative source for path flags (pathLead /
+    # pathRhythm / pathBass / bonusArr / represent) because the XML files bundled
+    # in official DLC PSARCs often have all path flags set to "0", while the
+    # manifest correctly reflects what the authoring tool wrote.
+    def _mprop_int(key: str, props: dict) -> int:
+        val = props.get(key, 0)
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            return 0
+
+    _manifest_names: dict[str, str] = {}
+    _manifest_path_flags: dict[str, dict] = {}
     for jf in Path(extracted_dir).rglob("*.json"):
         try:
             data = json.loads(jf.read_text())
@@ -1055,8 +1217,17 @@ def load_song(extracted_dir: str) -> Song:
                 attrs = v.get("Attributes") or {}
                 arr_name = attrs.get("ArrangementName", "")
                 if arr_name and arr_name not in ("Vocals", "ShowLights", "JVocals"):
+                    stem = jf.stem.lower()
                     # Match by JSON filename stem (same as XML stem)
-                    _manifest_names[jf.stem.lower()] = arr_name
+                    _manifest_names[stem] = arr_name
+                    props = attrs.get("ArrangementProperties") or {}
+                    _manifest_path_flags[stem] = {
+                        "path_lead": bool(_mprop_int("pathLead", props)),
+                        "path_rhythm": bool(_mprop_int("pathRhythm", props)),
+                        "path_bass": bool(_mprop_int("pathBass", props)),
+                        "bonus_arr": bool(_mprop_int("bonusArr", props)),
+                        "represent": _mprop_int("represent", props),
+                    }
         except Exception:
             continue
 
@@ -1128,6 +1299,17 @@ def load_song(extracted_dir: str) -> Song:
 
         # Parse arrangement
         arrangement = parse_arrangement(str(xml_path))
+
+        # Override path flags with manifest values when available. The XML
+        # bundled inside official DLC PSARCs often has all flags as "0", while
+        # the manifest JSON carries the correct values written by the DLC author.
+        manifest_flags = _manifest_path_flags.get(xml_path.stem.lower())
+        if manifest_flags:
+            arrangement.path_lead = manifest_flags["path_lead"]
+            arrangement.path_rhythm = manifest_flags["path_rhythm"]
+            arrangement.path_bass = manifest_flags["path_bass"]
+            arrangement.bonus_arr = manifest_flags["bonus_arr"]
+            arrangement.represent = manifest_flags["represent"]
 
         # Try to get the correct name from the manifest JSON
         manifest_name = _manifest_names.get(xml_path.stem.lower())
