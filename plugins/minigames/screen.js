@@ -979,4 +979,31 @@
   // hot-reload — re-install on a short delay then settle.
   setTimeout(installNavLink, 250);
   setTimeout(installNavLink, 1500);
+
+  // Re-install the nav link whenever the nav containers are mutated (e.g.
+  // after loadPlugins() clears and rebuilds #nav-plugins / #mobile-nav-plugins).
+  // We watch the desktop nav parent and the body for the mobile-menu insertion,
+  // debouncing with rAF so rapid successive mutations fire a single re-install.
+  (function watchNavMutations() {
+    if (typeof MutationObserver === 'undefined') return;
+    let _rafPending = false;
+    const onMutation = () => {
+      if (_rafPending) return;
+      _rafPending = true;
+      requestAnimationFrame(() => {
+        _rafPending = false;
+        // Only re-install when our link is actually gone (idempotent guard
+        // inside installNavLink checks id existence, but this outer check
+        // avoids calling the function on unrelated mutations).
+        if (!document.getElementById('mg-nav-link-desktop') ||
+            !document.getElementById('mg-nav-link-mobile')) {
+          installNavLink();
+        }
+      });
+    };
+    const obs = new MutationObserver(onMutation);
+    // Observe the top-level nav bar and the body (mobile menu is inserted lazily).
+    const nav = document.querySelector('nav') || document.body;
+    obs.observe(nav, { childList: true, subtree: true });
+  })();
 })();
