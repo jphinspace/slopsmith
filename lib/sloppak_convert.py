@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -662,6 +663,38 @@ def _get_whisperx_config() -> dict:
     }
 
 
+def _get_pitch_config() -> dict:
+    """Return the karaoke pitch-extraction sub-config from converter config.
+
+    Shape (all keys optional, defaults applied here):
+
+        {
+          "enabled": bool,         # default False — opt-in
+          "server_url": str | None,  # default None → fall back to demucs_server_url
+          "api_key": str | None,
+        }
+
+    When `server_url` is unset, callers fall through to
+    `_get_demucs_server_url()` — same pattern WhisperX uses, since the
+    same demucs server hosts the `/pitch` endpoint alongside `/separate`
+    and `/align`."""
+    cfg = _load_converter_config()
+    raw = cfg.get("pitch_extraction")
+    if not isinstance(raw, dict):
+        raw = {}
+    server_url = raw.get("server_url")
+    if isinstance(server_url, str):
+        server_url = server_url.rstrip("/") or None
+    else:
+        server_url = None
+    api_key = raw.get("api_key") if isinstance(raw.get("api_key"), str) else None
+    return {
+        "enabled": _coerce_bool(raw.get("enabled"), False),
+        "server_url": server_url,
+        "api_key": api_key or None,
+    }
+
+
 def _run_demucs_remote(full_ogg: Path, out_dir: Path, model: str) -> Path:
     """Run stem separation via remote demucs server."""
     import json
@@ -954,6 +987,51 @@ def _rewrite_lyrics_manifest(
     )
 
 
+def _load_lyrics_for_pitch(lyrics_path: Path) -> list[dict] | None:
+    """Load an existing lyrics JSON for pitch extraction's purposes.
+
+    The pitch endpoint only needs each entry's `t` + `d` (and rejects
+    non-numeric values server-side with a 4xx); the rest of the lyrics
+    shape (word text, formatting hints, etc.) is forwarded unchanged
+    but ignored. So this loader's bar is: return a list of dicts that
+    each have a numeric `t` + numeric `d`. Bools are excluded
+    explicitly because `isinstance(True, int)` is True in Python and
+    the endpoint would reject them. Any other shape (missing fields,
+    wrong types, top-level non-list, malformed JSON, IO error) returns
+    None so the caller skips the pitch hand-off rather than crashing
+    the surrounding transcription pass.
+
+    NOT a manifest reader — caller has already resolved the path via
+    `_existing_lyrics_path`. NOT a general lyrics validator — the
+    sloppak loader owns shape validation for read-time use."""
+    try:
+        raw = json.loads(lyrics_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        log.debug("_load_lyrics_for_pitch: %s read/parse failed: %s", lyrics_path, e)
+        return None
+    if not isinstance(raw, list):
+        return None
+    out: list[dict] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        t = entry.get("t")
+        d = entry.get("d")
+        if isinstance(t, bool) or isinstance(d, bool):
+            continue
+        if not isinstance(t, (int, float)) or not isinstance(d, (int, float)):
+            continue
+        # `json.loads` accepts the non-standard `NaN`/`Infinity`/`-Infinity`
+        # literals by default and turns them into Python floats — so the
+        # isinstance check above passes them through. Filter explicitly so
+        # they don't reach extract_pitch_remote() (which would re-serialize
+        # them and trigger a strict-server 4xx, or worse).
+        if not math.isfinite(float(t)) or not math.isfinite(float(d)):
+            continue
+        out.append(entry)
+    return out or None
+
+
 def _maybe_transcribe_lyrics(
     source_dir: Path,
     produced_stems: list[dict],
@@ -984,6 +1062,18 @@ def _maybe_transcribe_lyrics(
     Returns True when lyrics were written, False otherwise. All
     exceptions are caught and logged at WARNING — the caller treats
     transcription as best-effort."""
+    # Split this step's reserved slice between lyric transcription and
+    # the optional pitch extraction that runs on its output. Pitch
+    # takes the tail; transcription owns the head. Defined at the top
+    # of the function so the inner progress callbacks below (which
+    # scale WhisperX's 0..1 into our slice) can rescale into the lyric
+    # sub-portion rather than the whole slice — otherwise WhisperX
+    # progress could overshoot the lyric/pitch boundary and the bar
+    # would visibly move backwards once the lyric phase completes.
+    _LYRIC_PORTION = 0.7
+    _lyric_span = span_frac * _LYRIC_PORTION
+    _pitch_span = span_frac - _lyric_span
+
     # Helper: emit a "skip" progress update at the end of this step's
     # reserved slice so callers' progress printers / UIs don't stall
     # short of base_frac + span_frac when the transcription bails on
@@ -993,7 +1083,32 @@ def _maybe_transcribe_lyrics(
         return False
 
     if not enabled:
-        return False  # not reserving a progress slice when disabled
+        # WhisperX disabled, but pitch extraction may still be enabled
+        # AND find existing lyrics on disk to work with — don't bail
+        # before that flow gets a chance. Note: we only reach this
+        # branch when the outer caller actually decided to reserve a
+        # slice for us (either wx_enabled OR pitch_enabled in
+        # _split_in_dir), so flushing to the slice top on exit is
+        # correct either way.
+        existing = _existing_lyrics_path(source_dir)
+        if existing is not None:
+            vocals_path = source_dir / "stems" / "vocals.ogg"
+            if vocals_path.exists():
+                existing_lyrics = _load_lyrics_for_pitch(existing)
+                if existing_lyrics:
+                    _maybe_extract_pitch(
+                        source_dir, existing_lyrics, vocals_path,
+                        progress_cb=progress_cb,
+                        base_frac=base_frac,
+                        span_frac=span_frac,
+                    )
+                    return False
+        # No pitch hand-off happened — flush the slice the caller
+        # reserved for us so the progress bar still reaches the
+        # promised boundary.
+        _progress(progress_cb, base_frac + span_frac, "transcribing",
+                  "Lyric/pitch pass skipped (transcription disabled)")
+        return False
     if not any(s.get("id") == "vocals" for s in produced_stems):
         log.debug("_maybe_transcribe_lyrics: no vocals stem in produced output")
         return _skip("No vocals stem to transcribe")
@@ -1008,9 +1123,27 @@ def _maybe_transcribe_lyrics(
     # Checking only `source_dir / "lyrics.json"` would silently
     # overwrite an existing entry at a different location and leave
     # the manifest pointing at a new file we just wrote.
-    if not force and _existing_lyrics_path(source_dir) is not None:
+    existing_lyrics_path = (None if force else _existing_lyrics_path(source_dir))
+    if existing_lyrics_path is not None:
         log.info("_maybe_transcribe_lyrics: %s already has lyrics, skipping (use force=True to override)",
                  source_dir.name)
+        # Existing lyrics + a vocals stem + a configured server still
+        # satisfy the karaoke pitch pre-condition, even though we're
+        # not transcribing here. Load the on-disk lyrics and run pitch
+        # so sloppaks whose lyrics came from PSARC xml/sng (or were
+        # hand-authored) also get pre-generated karaoke pitch — not
+        # just the WhisperX-transcribed ones.
+        existing_lyrics = _load_lyrics_for_pitch(existing_lyrics_path)
+        if existing_lyrics:
+            _maybe_extract_pitch(
+                source_dir, existing_lyrics, vocals_path,
+                progress_cb=progress_cb,
+                base_frac=base_frac,
+                span_frac=span_frac,
+            )
+            # _maybe_extract_pitch flushes to base_frac + span_frac on
+            # every exit path, so we don't need an additional _skip flush.
+            return False
         return _skip("Lyrics already present")
 
     cfg = _get_whisperx_config()
@@ -1036,13 +1169,19 @@ def _maybe_transcribe_lyrics(
     # server hosts WhisperX at /align too), else local in-process.
     server_url = cfg["server_url"] or _get_demucs_server_url()
 
-    _progress(progress_cb, base_frac + span_frac * 0.10, "transcribing",
+    _progress(progress_cb, base_frac + _lyric_span * 0.10, "transcribing",
               "Transcribing vocals" + (f" (remote: {server_url})" if server_url else " (local)"))
 
     def _inner_cb(frac: float, stage: str, msg: str) -> None:
-        # Re-scale the transcriber's 0..1 progress into the slice this
-        # step owns in the outer convert/split pipeline.
-        _progress(progress_cb, base_frac + span_frac * (0.10 + 0.80 * frac), stage, msg)
+        # Re-scale the transcriber's 0..1 progress into the LYRIC
+        # sub-portion of our slice — so the lyric phase tops out at
+        # base + _lyric_span and the pitch phase has room to advance
+        # the bar further without it visibly moving backwards. Clamp
+        # the input so a transcriber that overshoots (e.g. emits >1.0
+        # on a "post-processing" stage) can't punch through the lyric
+        # boundary and force a backward step on the pitch hand-off.
+        clamped = max(0.0, min(1.0, frac))
+        _progress(progress_cb, base_frac + _lyric_span * (0.10 + 0.80 * clamped), stage, msg)
 
     try:
         if server_url:
@@ -1116,9 +1255,201 @@ def _maybe_transcribe_lyrics(
                 pass
         return _skip(f"Failed to write lyrics: {e}")
 
-    _progress(progress_cb, base_frac + span_frac, "transcribing",
+    # Lyric phase complete — flush to the top of its sub-portion
+    # (computed up-front as _lyric_span) so the bar settles cleanly
+    # at the lyric/pitch boundary before _maybe_extract_pitch takes
+    # over the tail. _inner_cb already scales WhisperX into this
+    # same sub-portion, so no backward motion is possible here.
+    _progress(progress_cb, base_frac + _lyric_span, "transcribing",
               f"Wrote {len(lyrics)} lyric tokens")
     log.info("_maybe_transcribe_lyrics: wrote %d tokens to %s", len(lyrics), lyrics_path)
+
+    # Karaoke pitch extraction is the natural next step now that we
+    # have BOTH a vocal stem AND syllable-level lyric timings. Best-
+    # effort: failures must not undo the lyric write we just persisted.
+    _maybe_extract_pitch(
+        source_dir, lyrics, vocals_path,
+        progress_cb=progress_cb,
+        base_frac=base_frac + _lyric_span,
+        span_frac=_pitch_span,
+    )
+    # Flush to the top of our reserved slice regardless of whether
+    # pitch ran, so the caller's progress bar always reaches the
+    # boundary the wrapper promised.
+    _progress(progress_cb, base_frac + span_frac, "transcribing",
+              "Lyric + pitch pass complete")
+    return True
+
+
+def _rewrite_pitch_manifest(
+    source_dir: Path,
+    pitch_rel: str,
+    *,
+    extraction: dict | None,
+) -> None:
+    """Set `vocal_pitch` + optional `pitch_extraction` block on the manifest.
+
+    Used by `_maybe_extract_pitch` after writing a fresh
+    `vocal_pitch.json`. Caller is responsible for having written the
+    file at `source_dir / pitch_rel` already.
+
+    `extraction` is the optional `pitch_extraction` provenance block
+    (engine / model / version) per the same shape `stem_separation`
+    and `lyric_transcription` use. Pass it when pitch came from an
+    automated engine (currently `crepe` via the demucs server); omit
+    for hand-edited pitch tracks. Passing `None` removes any existing
+    `pitch_extraction` key so a hand-edit doesn't inherit stale
+    auto-generated provenance."""
+    mf = source_dir / "manifest.yaml"
+    if not mf.exists():
+        mf = source_dir / "manifest.yml"
+    data = yaml.safe_load(mf.read_text(encoding="utf-8")) or {}
+    data["vocal_pitch"] = pitch_rel
+    if extraction is not None:
+        data["pitch_extraction"] = extraction
+    else:
+        data.pop("pitch_extraction", None)
+    mf.write_text(
+        yaml.safe_dump(data, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+
+
+def _maybe_extract_pitch(
+    source_dir: Path,
+    lyrics: list[dict],
+    vocals_path: Path,
+    *,
+    progress_cb: ProgressCB = None,
+    base_frac: float = 0.0,
+    span_frac: float = 0.0,
+) -> bool:
+    """Per-syllable pitch extraction via the demucs server's /pitch endpoint.
+
+    Best-effort sibling to `_maybe_transcribe_lyrics`. Called from
+    both the WhisperX success path and the existing-lyrics short-
+    circuit inside `_maybe_transcribe_lyrics`, so the vocals gate
+    below is enforced here rather than assumed from a single caller.
+    Fires when:
+      1. `pitch_extraction.enabled` is True in converter config.
+      2. There is at least one lyric token (the endpoint needs
+         timings — either freshly produced by WhisperX or loaded from
+         an existing on-disk lyrics file via `_load_lyrics_for_pitch`).
+      3. The vocal stem exists on disk (defensive — both production
+         call sites have already checked this, but tests + future
+         callers may not).
+      4. A server URL is configured (either `pitch_extraction.server_url`
+         or the shared `demucs_server_url`). Local CREPE is deferred.
+
+    `progress_cb` / `base_frac` / `span_frac` mirror the same slice
+    contract as `_maybe_transcribe_lyrics`: emit progress inside the
+    range `[base_frac, base_frac + span_frac]`. Defaults to a
+    zero-width slice so direct callers (tests, retroactive CLI) can
+    invoke without progress bookkeeping.
+
+    On success writes `vocal_pitch.json` (shape matches what
+    byrongamatos/slopsmith-plugin-lyrics-karaoke renders:
+    `{"version": 1, "notes": [{"t","d","midi"}, ...]}`) and adds
+    `vocal_pitch` + `pitch_extraction` keys to the manifest. On any
+    failure logs a warning and returns False — must NOT undo the
+    lyric write the surrounding transcription path already persisted."""
+    def _flush_skip(reason: str) -> bool:
+        # Mirror _maybe_transcribe_lyrics._skip — push the progress bar
+        # to the top of our reserved slice on early-exit so callers
+        # don't pin short of the boundary.
+        _progress(progress_cb, base_frac + span_frac, "pitch", reason)
+        return False
+
+    cfg = _get_pitch_config()
+    if not cfg["enabled"]:
+        log.debug("_maybe_extract_pitch: pitch_extraction.enabled=False — skipping")
+        return _flush_skip("Pitch extraction disabled")
+    if not lyrics:
+        log.debug("_maybe_extract_pitch: no lyrics — nothing to time pitch against")
+        return _flush_skip("No lyrics to time pitch against")
+    if not vocals_path.exists():
+        log.debug("_maybe_extract_pitch: vocals stem missing — skipping")
+        return _flush_skip("Vocals stem missing")
+
+    # Server URL precedence: explicit pitch_extraction.server_url first,
+    # else fall back to the shared demucs server (which hosts /pitch
+    # alongside /separate and /align).
+    server_url = cfg["server_url"] or _get_demucs_server_url()
+    if not server_url:
+        log.info("_maybe_extract_pitch: no server configured "
+                 "(pitch_extraction.server_url / demucs_server_url) — skipping. "
+                 "Local CREPE fallback not yet implemented.")
+        return _flush_skip("No pitch server configured")
+
+    try:
+        from vocal_pitch import (
+            extract_pitch_remote,
+            PITCH_EXTRACTION_ENGINE,
+            PITCH_EXTRACTION_MODEL,
+            PITCH_EXTRACTION_SCHEMA_VERSION,
+        )
+    except ImportError as e:
+        log.warning("_maybe_extract_pitch: vocal_pitch import failed: %s", e)
+        return _flush_skip(f"vocal_pitch import failed: {e}")
+
+    # Scale extract_pitch_remote's internal 0..1 progress into our
+    # reserved slice so the overall progress bar advances smoothly
+    # through upload + inference, rather than waiting until the call
+    # returns to jump.
+    def _scaled_progress(frac: float, stage: str, msg: str) -> None:
+        clamped = max(0.0, min(1.0, frac))
+        _progress(progress_cb, base_frac + span_frac * clamped, stage, msg)
+
+    try:
+        notes = extract_pitch_remote(
+            vocals_path, lyrics, server_url,
+            api_key=cfg["api_key"],
+            progress_cb=_scaled_progress,
+        )
+    except Exception as e:
+        log.warning("_maybe_extract_pitch: pitch extraction failed for %s: %s",
+                    source_dir.name, e, exc_info=True)
+        return _flush_skip(f"Pitch extraction failed: {e}")
+
+    if not notes:
+        log.info("_maybe_extract_pitch: %s produced no notes", source_dir.name)
+        return _flush_skip("No pitch notes produced")
+
+    pitch_path = source_dir / "vocal_pitch.json"
+    pitch_payload = {"version": 1, "notes": notes}
+    extraction_meta = {
+        "engine": PITCH_EXTRACTION_ENGINE,
+        "model": PITCH_EXTRACTION_MODEL,
+        "version": PITCH_EXTRACTION_SCHEMA_VERSION,
+    }
+    try:
+        # `allow_nan=False` so non-finite floats raise ValueError here
+        # rather than silently writing non-standard `NaN`/`Infinity`
+        # tokens that strict JSON consumers (e.g. browsers,
+        # `json.loads` with `parse_constant`) would reject. Belt-and-
+        # braces — `extract_pitch_remote` already filters non-finite
+        # values on the way in, but this catches a future call site
+        # that bypasses that loader.
+        pitch_path.write_text(
+            json.dumps(pitch_payload, separators=(",", ":"), allow_nan=False),
+            encoding="utf-8",
+        )
+        _rewrite_pitch_manifest(
+            source_dir, "vocal_pitch.json", extraction=extraction_meta,
+        )
+    except Exception as e:
+        log.warning("_maybe_extract_pitch: failed to persist pitch for %s: %s",
+                    source_dir.name, e, exc_info=True)
+        if pitch_path.exists():
+            try:
+                pitch_path.unlink()
+            except OSError:
+                pass
+        return _flush_skip(f"Failed to write pitch: {e}")
+
+    _progress(progress_cb, base_frac + span_frac, "pitch",
+              f"Wrote {len(notes)} pitch notes")
+    log.info("_maybe_extract_pitch: wrote %d notes to %s", len(notes), pitch_path)
     return True
 
 
@@ -1141,12 +1472,18 @@ def _split_in_dir(
     use_remote = remote_url is not None
 
     # Reserve the tail of the progress budget for the optional WhisperX
-    # transcription step. Demucs gets the bulk (0..split_span); transcription
-    # owns the rest (split_span..1.0). When transcription is disabled the
-    # entire span is consumed by splitting.
+    # transcription + pitch-extraction steps. Demucs gets the bulk
+    # (0..split_span); the lyric/pitch pass owns the rest
+    # (split_span..1.0). The slice is reserved when EITHER WhisperX OR
+    # pitch extraction is enabled — pitch alone is enough to need the
+    # tail because it runs on existing lyrics even when WhisperX is
+    # disabled (the "Lyrics already present" short-circuit inside
+    # _maybe_transcribe_lyrics handles the hand-off).
     wx_enabled = bool(transcribe_lyrics if transcribe_lyrics is not None
                       else _get_whisperx_config()["enabled"])
-    split_span = span_frac * (0.85 if wx_enabled else 1.0)
+    pitch_enabled = bool(_get_pitch_config()["enabled"])
+    needs_post_split = wx_enabled or pitch_enabled
+    split_span = span_frac * (0.85 if needs_post_split else 1.0)
 
     if use_remote:
         _progress(progress_cb, base_frac + split_span * 0.05, "splitting",
@@ -1188,17 +1525,20 @@ def _split_in_dir(
             return (len(_STEM_ORDER), s["id"])
     produced.sort(key=_order_key)
 
-    # Optional WhisperX transcription — runs after stems are encoded
-    # but before `full.ogg` is removed (the order doesn't strictly
-    # matter for the vocals stem, which is independent, but keeping
-    # `full.ogg` around through the transcription call gives a fallback
-    # input if a future variant ever needs the mixed track). Wrapped
-    # internally so failures don't break the split.
-    if wx_enabled:
+    # Optional WhisperX transcription + pitch extraction — runs after
+    # stems are encoded but before `full.ogg` is removed (the order
+    # doesn't strictly matter for the vocals stem, which is
+    # independent, but keeping `full.ogg` around through the
+    # transcription call gives a fallback input if a future variant
+    # ever needs the mixed track). Wrapped internally so failures
+    # don't break the split. The `enabled` argument controls only
+    # WhisperX; _maybe_transcribe_lyrics still attempts pitch
+    # extraction on existing lyrics when wx is off but pitch is on.
+    if needs_post_split:
         _maybe_transcribe_lyrics(
             source_dir,
             produced,
-            enabled=True,
+            enabled=wx_enabled,
             progress_cb=progress_cb,
             base_frac=base_frac + split_span,
             span_frac=span_frac - split_span,

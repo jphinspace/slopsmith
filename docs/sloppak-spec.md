@@ -81,6 +81,8 @@ Full set of currently-recognized top-level keys:
 | `lyrics` | string | no | Path to lyrics JSON |
 | `lyrics_source` | string | no | Where the lyrics came from: `xml` (Rocksmith vocals.xml), `sng` (encrypted Rocksmith vocals.sng), `whisperx` (auto-transcribed), or `user` (hand-edited). Absent on legacy sloppaks — readers should treat missing as `xml` |
 | `lyric_transcription` | object | no | Structured metadata when lyrics came from an automated engine (currently `whisperx`). Same shape as the parent `stem_separation` block defined by [slopsmith#357](https://github.com/byrongamatos/slopsmith/issues/357) — see §2.3 for fields and semver semantics. Omitted for authored lyrics (`xml`/`sng`/`user`) |
+| `vocal_pitch` | string | no | Path to per-syllable pitch JSON (`{"version": 1, "notes": [{t, d, midi}, ...]}`). Consumed by [slopsmith-plugin-lyrics-karaoke](https://github.com/byrongamatos/slopsmith-plugin-lyrics-karaoke) to render karaoke note bars. See §2.4 |
+| `pitch_extraction` | object | no | Structured metadata when pitch was extracted by an automated engine (currently `crepe` via the demucs server's `/pitch` endpoint). Same shape as `stem_separation` / `lyric_transcription`. Omitted for hand-edited pitch tracks |
 | `cover` | string | no | Path to cover image |
 
 Unknown keys are **silently ignored** by the loader. This is deliberate — it's the extensibility hook (see §5).
@@ -156,6 +158,38 @@ Fields:
 - `version` — semver for Slopsmith's lyric-transcription artifact contract (independent of upstream Whisper / WhisperX versions). Bump per the same semantics #357 defines for stems: patch = metadata-only fixes, minor = backward-compatible additions, major = output shape changed and existing transcriptions should be regenerated.
 
 Omitted for authored lyrics (`xml` / `sng` / `user`). A remote WhisperX server can use this block as part of a cache key the same way #357 envisions for stems — caches should miss whenever any of the three fields change, ensuring stale transcriptions don't get returned after a model bump.
+
+### 2.4. `vocal_pitch`
+
+If present, points at a JSON file holding per-syllable pitch data — the karaoke companion to `lyrics`. Consumed by [slopsmith-plugin-lyrics-karaoke](https://github.com/byrongamatos/slopsmith-plugin-lyrics-karaoke) to render karaoke-style note bars over the lyric text. Shape:
+
+```json
+{
+  "version": 1,
+  "notes": [
+    {"t": 12.34, "d": 0.40, "midi": 64},
+    {"t": 12.78, "d": 0.55, "midi": 67}
+  ]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `version` | Schema version of this `vocal_pitch.json` file (currently the integer `1`). Bump on a breaking change to the `notes` entry shape. This is *not* the same as the top-level `pitch_extraction.version` block below, which is a semver string used as a cache-key for the extractor engine |
+| `notes` | List of pitch entries, one per syllable that the extractor could lock onto. `t` + `d` mirror the matching `lyrics.json` entry; `midi` is the MIDI note number (60 = middle C). Syllables the extractor couldn't pitch (silent / sub-confidence) are omitted from this list — it may be shorter than `lyrics.json` |
+
+When pitch came from an automated engine (the demucs server's `/pitch` endpoint, which runs CREPE), the optional top-level `pitch_extraction` block records which engine + model produced the file. Same shape and semver-string semantics as `stem_separation` / `lyric_transcription` — distinct from the in-file integer `version` field above:
+
+```yaml
+pitch_extraction:
+  engine: crepe
+  model: v1
+  version: 1.0.0
+```
+
+Omitted for hand-edited pitch tracks. As with the other two automated-artifact blocks, a remote pitch server can use this for cache-key invalidation.
+
+The PSARC→sloppak converter runs pitch extraction automatically when `pitch_extraction.enabled` is set in converter config AND a server URL is configured (either `pitch_extraction.server_url` or the shared `demucs_server_url`) AND the sloppak has lyrics + a `stems/vocals.ogg` after the split pass — either because `_maybe_transcribe_lyrics` just produced them via WhisperX OR because they were already on disk (from PSARC xml/sng, hand-authoring, or an earlier convert). Pitch is *not* coupled to `whisperx.enabled` — setting `pitch_extraction.enabled=true` alone (with WhisperX off) is enough to retro-generate pitch over any existing on-disk lyrics. Sloppaks built before this field existed simply don't carry it — readers should treat missing `vocal_pitch` as "no pitch data, fall back to whatever the karaoke plugin's local-extraction path produces (if any)".
 
 ---
 
@@ -548,12 +582,17 @@ keys: keys.json
 
 Each entry implicitly applies until the next event. Same model as `sections[]`.
 
-#### Vocal pitch contour
+#### Vocal pitch contour (a different shape, a different key)
 
-If you want a vocal-pitch overlay separate from the lyrics karaoke layer:
+The canonical `vocal_pitch` key + file (defined in §2.4) is the
+per-syllable note format consumed by the karaoke plugin —
+`{version: 1, notes: [{t, d, midi}]}`. If you want to ship a finer-
+grained pitch *contour* (one sample every 20 ms, Hz instead of MIDI),
+that's a different shape and should ride on its own manifest key so
+the two don't collide:
 
 ```yaml
-vocal_pitch: vocal_pitch.json
+vocal_pitch_contour: vocal_pitch_contour.json
 ```
 
 ```json
@@ -566,17 +605,8 @@ vocal_pitch: vocal_pitch.json
 }
 ```
 
-Or — if your data comes as windows of sustained notes — use the same shape as Rocksmith's `vocals.xml`:
-
-```json
-{
-  "version": 1,
-  "notes": [
-    {"t": 12.34, "d": 0.4, "midi": 64},
-    {"t": 12.74, "d": 0.6, "midi": 67}
-  ]
-}
-```
+Per §5.1, manifest keys are cheap — reach for a new one when the
+schema diverges, don't overload an existing key with a second shape.
 
 ### 5.4. `version` field — always include it
 
