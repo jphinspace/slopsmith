@@ -189,7 +189,7 @@ pitch_extraction:
 
 Omitted for hand-edited pitch tracks. As with the other two automated-artifact blocks, a remote pitch server can use this for cache-key invalidation.
 
-The PSARC→sloppak converter runs pitch extraction automatically when `pitch_extraction.enabled` is set in converter config AND a server URL is configured (either `pitch_extraction.server_url` or the shared `demucs_server_url`) AND `_maybe_transcribe_lyrics` produced lyrics in the same pass. Sloppaks built before this field existed simply don't carry it — readers should treat missing `vocal_pitch` as "no pitch data, fall back to whatever the karaoke plugin's local-extraction path produces (if any)".
+The PSARC→sloppak converter runs pitch extraction automatically when `pitch_extraction.enabled` is set in converter config AND a server URL is configured (either `pitch_extraction.server_url` or the shared `demucs_server_url`) AND the sloppak ends up with lyrics in the same pass — either because `_maybe_transcribe_lyrics` just produced them via WhisperX OR because they were already on disk (from PSARC xml/sng, hand-authoring, or an earlier convert). Sloppaks built before this field existed simply don't carry it — readers should treat missing `vocal_pitch` as "no pitch data, fall back to whatever the karaoke plugin's local-extraction path produces (if any)".
 
 ---
 
