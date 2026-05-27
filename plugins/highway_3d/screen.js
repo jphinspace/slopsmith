@@ -3078,6 +3078,75 @@
         }
 
         // ── Object pool ────────────────────────────────────────────────────
+        // ── Opt-in perf bench harness (slopsmith#226) ──────────────────────
+        // Enable with `?h3dbench=1` on the player URL. Aggregates per-segment
+        // timings of update() into a console.log every _PB_REPORT_MS.
+        //
+        // When the bench is OFF, pbBeg/pbEnd/pbReportTick are bound to a
+        // single shared empty function literal when this renderer
+        // instance is created (createHighway() runs once per panel, not
+        // once per module load) — V8 typically inlines empty bodies and
+        // the call sites have minimized overhead in the hot path.
+        // (Previously they had `if (!_perfBench) return;` guards, which
+        // still cost a function-call frame per mark site per frame;
+        // Copilot review on #413.) Inlining is a JIT heuristic, not a
+        // language guarantee.
+        const _perfBench = (() => {
+            try { return new URLSearchParams(location.search).get('h3dbench') === '1'; }
+            catch (_) { return false; }
+        })();
+        let pbBeg, pbEnd, pbReportTick;
+        if (_perfBench) {
+            const _PB_NAMES = ['frame', 'state', 'next', 'mat', 'noteDraw', 'chordDraw'];
+            const _pbStart = new Float64Array(_PB_NAMES.length);
+            const _pbAcc = _PB_NAMES.map(() => []);
+            const _PB_REPORT_MS = 5000;
+            let _pbReportStart = 0;
+            let _pbFrameCount = 0;
+            pbBeg = function pbBeg(idx) { _pbStart[idx] = performance.now(); };
+            pbEnd = function pbEnd(idx) {
+                _pbAcc[idx].push(performance.now() - _pbStart[idx]);
+            };
+            pbReportTick = function pbReportTick() {
+                const now = performance.now();
+                if (_pbReportStart === 0) {
+                    // First call: discard the sample(s) that already
+                    // landed in _pbAcc from the very first frame's
+                    // pbEnd() calls, so fps and segment stats span the
+                    // same frame set on every reported window.
+                    _pbReportStart = now;
+                    _pbFrameCount = 0;
+                    for (let i = 0; i < _PB_NAMES.length; i++) _pbAcc[i].length = 0;
+                    return;
+                }
+                _pbFrameCount++;
+                if (now - _pbReportStart < _PB_REPORT_MS) return;
+                const dur = now - _pbReportStart;
+                const fps = (_pbFrameCount / dur * 1000).toFixed(1);
+                const parts = [];
+                for (let i = 0; i < _PB_NAMES.length; i++) {
+                    const arr = _pbAcc[i];
+                    if (!arr.length) { parts.push(`${_PB_NAMES[i]}=-`); continue; }
+                    arr.sort((a, b) => a - b);
+                    const n = arr.length;
+                    // Nearest-rank: ceil(p · n) - 1, clamped to [0, n-1].
+                    // Avoids the off-by-one where Math.floor(n * 0.95)
+                    // returns the last element (effectively the max)
+                    // for small samples (e.g. n=20 → idx 19).
+                    const p50 = arr[Math.max(0, Math.ceil(0.50 * n) - 1)];
+                    const p95 = arr[Math.max(0, Math.ceil(0.95 * n) - 1)];
+                    const mx = arr[n - 1];
+                    parts.push(`${_PB_NAMES[i]} p50=${p50.toFixed(2)} p95=${p95.toFixed(2)} max=${mx.toFixed(2)}`);
+                    arr.length = 0;
+                }
+                console.log(`[h3dbench] ${fps}fps (${_pbFrameCount} frames) over ${(dur/1000).toFixed(1)}s — ${parts.join(' | ')}`);
+                _pbReportStart = now;
+                _pbFrameCount = 0;
+            };
+        } else {
+            pbBeg = pbEnd = pbReportTick = function () {};
+        }
+
         function pool(parent, mk) {
             const a = [];
             let n = 0;
@@ -3092,23 +3161,47 @@
                     const o = mk(); parent.add(o); a.push(o); n++; return o;
                 },
                 reset() { for (let i = 0; i < n; i++) a[i].visible = false; n = 0; },
+                // Pre-allocate `cap` slots at construction so the first dense
+                // playback frames don't pay the new-Mesh allocation cost
+                // mid-RAF (felt as a stall on 7/8-string charts where the
+                // visible-note count outruns the lazy-grow path). Lazy growth
+                // past `cap` still works — this is amortisation, not a cap.
+                //
+                // Coerce `cap` to a non-negative int32: a float would still
+                // work but a callsite passing `Infinity` (or `NaN`) would
+                // otherwise spin the while-loop until OOM. `cap | 0`
+                // truncates floats, clamps Infinity → 0, and turns NaN → 0;
+                // Math.max(0, …) keeps negatives out.
+                warm(cap) {
+                    // Local rename to avoid shadowing the pool's outer
+                    // `n` (the in-use index advanced by get() / reset()).
+                    const targetLen = Math.max(0, cap | 0);
+                    while (a.length < targetLen) { const o = mk(); o.visible = false; parent.add(o); a.push(o); }
+                    return this;
+                },
             };
         }
 
-        // Returns the longest consecutive sub-array from a sorted integer array.
-        // @param {number[]} sorted - Sorted array of column indices (e.g. fretted column indices).
-        // @returns {number[]} The longest run where each element equals the previous + 1.
+        // Returns indices of the longest consecutive run in a sorted integer
+        // array as { start, len } — `sorted[start..start+len)` is the run.
+        // Avoids the two per-call sub-array allocations of the previous
+        // implementation (best + cur arrays grown via .push), at the cost
+        // of one small 2-key result object. Net: callers in the chord-
+        // diagram render path no longer churn arrays per visible chord.
         function longestConsecutiveRun(sorted) {
-            let best = [], cur = [];
+            let bestStart = -1, bestLen = 0;
+            let curStart = -1, curLen = 0;
             for (let i = 0; i < sorted.length; i++) {
-                if (cur.length === 0 || sorted[i] === cur[cur.length - 1] + 1) {
-                    cur.push(sorted[i]);
+                if (curLen === 0 || sorted[i] === sorted[curStart + curLen - 1] + 1) {
+                    if (curLen === 0) curStart = i;
+                    curLen++;
                 } else {
-                    if (cur.length > best.length) best = cur;
-                    cur = [sorted[i]];
+                    if (curLen > bestLen) { bestLen = curLen; bestStart = curStart; }
+                    curStart = i; curLen = 1;
                 }
             }
-            return cur.length > best.length ? cur : best;
+            if (curLen > bestLen) { bestLen = curLen; bestStart = curStart; }
+            return { start: bestStart, len: bestLen };
         }
 
         /* ── Lyrics overlay (2D canvas on top of WebGL) ─────────────────── */
@@ -3346,9 +3439,9 @@
                 if (frets[getStrIdx(col)] === startFret) startFretCols.push(col);
             }
             const barreRun = longestConsecutiveRun(startFretCols);
-            let hasBarreArc = barreRun.length >= 2;   // PATH A
-            let barreMinCol = hasBarreArc ? barreRun[0] : -1;
-            let barreMaxCol = hasBarreArc ? barreRun[barreRun.length - 1] : -1;
+            let hasBarreArc = barreRun.len >= 2;   // PATH A
+            let barreMinCol = hasBarreArc ? startFretCols[barreRun.start] : -1;
+            let barreMaxCol = hasBarreArc ? startFretCols[barreRun.start + barreRun.len - 1] : -1;
 
             if (startFretCols.length >= 2) {             // PATH B
                 const minC = startFretCols[0];
@@ -4601,6 +4694,57 @@
             // cached texture map.
             pFretColMarker = pool(lblG, () => new T.Sprite(txtMat('0', '#666666', false, 'noteFret').clone()));
 
+            // ── Pre-warm pools (slopsmith#226) ─────────────────────────────
+            // Dense 7/8-string charts can outrun the lazy-grow path in the
+            // first 1-2s of playback, stalling those frames with `new T.Mesh`
+            // allocations *and* growing noteG forever (the pool only hides on
+            // reset). Pay the cost up front instead.
+            //
+            // Trade-off: pre-warming attaches the same meshes to noteG even
+            // on 4/6-string charts that may never use them all. The cost is
+            // paid at boardInit (during the load spinner — wall-clock time
+            // users were already waiting on), so the steady-state win on
+            // playback FPS is worth the init-time scene-graph footprint.
+            // Caps sized for a typical visible-window worst case (NOT the
+            // theoretical max across MAX_RENDER_STRINGS); lazy growth past
+            // the warm cap still works for genuinely dense outliers.
+            const _WARM_NOTE = 48;
+            const _WARM_CHORD = 12;
+            const _WARM_LANE = 32;
+            const _WARM_BEAT = 24;
+            pNote.warm(_WARM_NOTE);
+            pNoteEdge.warm(_WARM_NOTE);
+            pAccentHalo.warm(_WARM_NOTE);
+            pSus.warm(_WARM_NOTE);
+            pSusOutline.warm(_WARM_NOTE);
+            pSusRibbon.warm(_WARM_NOTE / 2);
+            pSusRibbonOl.warm(_WARM_NOTE / 2);
+            pTapChevron.warm(_WARM_CHORD);
+            pLbl.warm(_WARM_NOTE);
+            pSusRail.warm(_WARM_CHORD);
+            pSusRailBloom.warm(_WARM_CHORD);
+            pTechPlane.warm(_WARM_CHORD);
+            pNoteFretLabel.warm(_WARM_NOTE);
+            pChordFrameFill.warm(_WARM_CHORD);
+            pChordBox.warm(_WARM_CHORD);
+            pChordLbl.warm(_WARM_CHORD);
+            pBarreLine.warm(_WARM_CHORD);
+            pArpBracket.warm(_WARM_CHORD);
+            pHaloBar.warm(_WARM_CHORD);
+            pPMXFill.warm(_WARM_CHORD);
+            pFHXFill.warm(_WARM_CHORD);
+            pMuteXLines.warm(_WARM_CHORD);
+            pFHXLines.warm(_WARM_CHORD);
+            pFretLbl.warm(_WARM_LANE);
+            pLane.warm(_WARM_LANE * 2);  // anchor-driven lanes × time slices
+            pLaneDivider.warm(_WARM_LANE);
+            pGhostFretLbl.warm(_WARM_LANE);
+            pFretColMarker.warm(_WARM_LANE);
+            pConnectorLine.warm(_WARM_NOTE / 2);
+            pDropLine.warm(_WARM_NOTE / 2);
+            pBeat.warm(_WARM_BEAT);
+            pSec.warm(8);
+
             _bgLoadSettings();
             buildBoard();
 
@@ -5412,20 +5556,37 @@
             // Vibrancy controls the idle opacity floor — anticipation
             // still rides on top regardless of vibrancy so play-feedback
             // through the opacity channel survives even at glowMul=0.
+            //
+            // Folded with the post-noteState mGlow / mAccentCore writes
+            // (was a separate `for (s = 0; s < nStr)` loop in update()),
+            // so the per-string scratch arrays stay hot in L1 across all
+            // material writes for a given string.
             const BASE_GLOW = 0.02 * glowMul;
             const MAX_GLOW  = 3.5  * glowMul;
             const IDLE_OP   = _vibrancyIdleOp;
+            const g = glowMul;
 
             for (let s = 0; s < nStr; s++) {
                 const mesh = stringLines[s];
-                if (!mesh) continue;
-                const intensity = Math.max(
-                    noteState.stringSustain[s] ? 1 : 0,
-                    noteState.stringAnticipation[s] || 0,
-                );
-                mesh.material.emissiveIntensity = BASE_GLOW + intensity * MAX_GLOW;
-                mesh.material.opacity = IDLE_OP + intensity * (1 - IDLE_OP);
-                mesh.scale.set(1, 1 + intensity * 0.3, 1 + intensity * 0.3);
+                if (mesh) {
+                    const intensity = Math.max(
+                        noteState.stringSustain[s] ? 1 : 0,
+                        noteState.stringAnticipation[s] || 0,
+                    );
+                    mesh.material.emissiveIntensity = BASE_GLOW + intensity * MAX_GLOW;
+                    mesh.material.opacity = IDLE_OP + intensity * (1 - IDLE_OP);
+                    mesh.scale.set(1, 1 + intensity * 0.3, 1 + intensity * 0.3);
+                }
+                // Hit-note emissive — same write pattern as the standalone
+                // loop that previously lived at update()'s post-call site.
+                // The glow slider scales it here since this assignment
+                // stomps anything _applyGlow() set statically.
+                const bg = noteState.strGlow[s] * g;
+                if (mGlow[s]) mGlow[s].emissiveIntensity = bg;
+                if (mAccentCore[s]) {
+                    mAccentCore[s].emissiveIntensity =
+                        bg + noteState.accentFillBoost[s] * g;
+                }
             }
         }
 
@@ -6267,6 +6428,7 @@
 
         /* ── Per-frame rendering ─────────────────────────────────────────── */
         function update(bundle) {
+            pbBeg(0);
             // Materialize the text-size multiplier from the user's slider.
             // textSize ∈ [0,1]; _textSizeMul ∈ [0.5, 1.5] with 0.5 ↦ 1.0×
             // so default behaviour matches what the renderer did pre-slider.
@@ -6605,6 +6767,7 @@
                 accentFillBoost:  _scrAccentFillBoost,
             };
 
+            pbBeg(1);
             // Compute sustain / anticipation / fret heat / per-string glow.
             // Use lowerBoundT to skip notes far in the past (>30s sustain is
             // unrealistic); break once notes are >2s ahead (nothing beyond
@@ -6666,6 +6829,8 @@
                 }
             }
 
+            pbEnd(1);
+            pbBeg(2);
             // ── Next-note-by-string lookahead (for anticipation projection) ──
             // Ghost projection window is 0.6s; fretLastActiveTime needs +2s.
             // Use lowerBoundT to skip past notes and break at +2s.
@@ -6880,19 +7045,13 @@
                 }
             }
 
+            pbEnd(2);
+            pbBeg(3);
+            // mGlow / mAccentCore emissive writes are folded into
+            // updateStringHighlights() — same per-string scratch reads,
+            // one pass.
             updateStringHighlights(noteState);
-            // Hit-note emissive is per-frame from noteState.strGlow[s]; the
-            // glow slider scales it at the assignment site since this
-            // write would stomp anything _applyGlow() set statically.
-            // mAccentCore adds accentFillBoost (accent-only bright fill).
-            for (let s = 0; s < nStr; s++) {
-                const bg = noteState.strGlow[s] * glowMul;
-                if (mGlow[s]) mGlow[s].emissiveIntensity = bg;
-                if (mAccentCore[s]) {
-                    mAccentCore[s].emissiveIntensity =
-                        bg + noteState.accentFillBoost[s] * glowMul;
-                }
-            }
+            pbEnd(3);
 
             // Active frets (notes in cooldown window) + highway intensity
             _scrActiveFrets.clear();
@@ -7080,6 +7239,7 @@
                 } // end !_camSnapped (post-prescan guard)
             }
 
+            pbBeg(4);
             // ── Single notes ──────────────────────────────────────────────
             // Tracks which (chordId → Set<stringIndex>) pairs already had
             // brackets drawn by the note-stream loop, so the chord loop can
@@ -7227,6 +7387,8 @@
                 }
             }
 
+            pbEnd(4);
+            pbBeg(5);
             // ── Chords ────────────────────────────────────────────────────
             if (chords) {
                 // Single-pass shape-run tracking: the previous pre-loop scanned
@@ -8941,6 +9103,9 @@
                     _diagPrevOpacity = Math.max(0, _diagPrevStartOpacity * (1 - fadedT / DIAG_CROSSFADE_S));
                 }
             }
+            pbEnd(5);
+            pbEnd(0);
+            pbReportTick();
         }
 
         /**

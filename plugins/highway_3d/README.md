@@ -32,3 +32,7 @@ Most of the visual controls (background style, intensity, audio reactivity, colo
 ## Contributing / development
 
 For maintainers and AI assistants working on the codebase, see [`CLAUDE.md`](CLAUDE.md) — it's a navigation guide that maps every visual element to where it lives in `screen.js`, plus the gotchas worth knowing before tweaking.
+
+### Perf bench (`?h3dbench=1`)
+
+Append `?h3dbench=1` to the player URL to enable opt-in `console.log` reporting of `update()` self-time, broken into six segments — `frame` (everything between `pbBeg(0)` at the top of `update()` and `pbEnd(0)` at the bottom; excludes the trailing `pbReportTick()` logging that fires after `pbEnd(0)`), `state` (per-frame state-derivation loop), `next` (next-note-by-string lookahead), `mat` (per-string material writes), `noteDraw` (single-note draw loop), `chordDraw` (chord draw loop). Reported every 5 seconds with p50 / p95 / max per segment and frame count, so before/after numbers on a target chart are reproducible (slopsmith#226). Off-by-default; the bench helpers (`pbBeg` / `pbEnd` / `pbReportTick`) are bound to a shared empty-function literal when the renderer instance is created (each `createHighway()` panel re-checks the flag), so the hot-path call sites are no-ops with negligible overhead (typically JIT-inlined).
